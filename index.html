@@ -98,13 +98,17 @@
     <div class="slide"><label>Field of view</label><input type="range" id="fov" min="40" max="90" value="63"><output id="oFov">63°</output></div>
     <div class="slide"><label>Heading trim</label><input type="range" id="trim" min="-40" max="40" value="0"><output id="oTrim">0°</output></div>
     <div class="slide"><label>Sat TLE URL</label><input type="text" id="tleUrl" value="https://celestrak.org/NORAD/elements/gp.php?GROUP=visual&FORMAT=tle"></div>
+    <div class="slide"><label>Manual lat,lon</label><input type="text" id="manual" placeholder="e.g. 36.90,-82.00 — use if GPS won't prompt"></div>
   </div>
 
+  <div id="diag" class="hint">GPS — · CMP — · AIR — · SAT — · secure —</div>
+
   <div class="btnrow">
-    <button id="start" class="primary">Start camera</button>
+    <button id="geo" class="primary">Location</button>
+    <button id="start" class="primary">Camera</button>
     <button id="sensors">Compass</button>
     <button id="loadSat">Load sats</button>
-    <button id="capture" disabled>Screenshot</button>
+    <button id="capture" disabled>Shot</button>
   </div>
 </div>
 
@@ -209,14 +213,40 @@ let tab='sky';
 function switchTab(t){tab=t;$('tabSky').setAttribute('aria-selected',t==='sky');
   $('tabAn').setAttribute('aria-selected',t==='an');renderSheet();}
 
-/* ============================ geolocation ============================ */
-if(navigator.geolocation){
-  navigator.geolocation.watchPosition(p=>{
-    me={lat:p.coords.latitude,lon:p.coords.longitude,alt:p.coords.altitude||300};
-    $('hGps').textContent=me.lat.toFixed(3)+','+me.lon.toFixed(3);
-  },()=>{$('hGps').textContent='no fix';setStatus('No GPS — sky math needs your location. Enable location.','err');},
-  {enableHighAccuracy:true,maximumAge:15000,timeout:12000});
+/* ============================ diagnostics ============================ */
+const diag={gps:'—',compass:'—',air:'—',sat:'—'};
+function renderDiag(){
+  const sec=window.isSecureContext?'yes':'NO';
+  const framed=(window.self!==window.top)?' · IFRAME (open in Safari)':'';
+  $('diag').innerHTML=`GPS ${diag.gps} · CMP ${diag.compass} · AIR ${diag.air} · SAT ${diag.sat} · secure ${sec}${framed}`;
 }
+renderDiag();
+
+/* ============================ geolocation (tap-triggered) ============================ */
+function applyPos(p){
+  me={lat:p.coords.latitude,lon:p.coords.longitude,alt:p.coords.altitude||300};
+  diag.gps='ok';$('hGps').textContent=me.lat.toFixed(3)+','+me.lon.toFixed(3);
+  $('geo').textContent='Located';renderDiag();refreshSky();
+}
+$('geo').addEventListener('click',()=>{
+  if(!navigator.geolocation){diag.gps='no api';renderDiag();
+    setStatus('No geolocation API. Type coordinates in the manual field.','err');return;}
+  setStatus('Requesting location — accept the prompt…');
+  navigator.geolocation.getCurrentPosition(applyPos,e=>{
+    diag.gps='denied';renderDiag();
+    setStatus('Location blocked: '+e.message+'. If no prompt appeared you\'re likely in an app preview — '+
+      'deploy to Pages and open the https URL in Safari, or type lat,lon in the manual field.','err');
+  },{enableHighAccuracy:true,timeout:12000,maximumAge:10000});
+  try{navigator.geolocation.watchPosition(applyPos,()=>{},{enableHighAccuracy:true,maximumAge:15000});}catch(e){}
+});
+$('manual').addEventListener('change',e=>{
+  const m=e.target.value.split(',').map(s=>parseFloat(s.trim()));
+  if(m.length===2&&isFinite(m[0])&&isFinite(m[1])){
+    me={lat:m[0],lon:m[1],alt:300};diag.gps='manual';
+    $('hGps').textContent=me.lat.toFixed(3)+','+me.lon.toFixed(3);renderDiag();refreshSky();
+    setStatus('Manual location set — aircraft and sky now computed from it.','ok');
+  } else setStatus('Format: lat,lon  (e.g. 36.90,-82.00)','err');
+});
 
 /* ============================ camera ============================ */
 $('start').addEventListener('click',async()=>{
@@ -246,20 +276,22 @@ function onOrient(ev){
   else if(typeof ev.alpha==='number')heading=rev(360-ev.alpha);
   if(typeof ev.beta==='number')elevation=Math.max(-90,Math.min(90,ev.beta-90));
   if(typeof ev.gamma==='number')roll=ev.gamma;
+  if(diag.compass!=='ok'){diag.compass='ok';renderDiag();}
   $('hBrg').textContent=heading==null?'—':Math.round(heading).toString().padStart(3,'0')+'°';
   $('hElv').textContent=elevation==null?'—':Math.round(elevation)+'°';
 }
 
 /* ============================ data sources ============================ */
 async function loadAircraft(){
-  if(!me)return;
+  if(!me){diag.air='no gps';renderDiag();return;}
   const urls=[
     `https://api.airplanes.live/v2/point/${me.lat.toFixed(4)}/${me.lon.toFixed(4)}/100`,
     `https://opendata.adsb.fi/api/v2/lat/${me.lat.toFixed(4)}/lon/${me.lon.toFixed(4)}/dist/100`];
   for(const u of urls){try{const r=await fetch(u,{headers:{Accept:'application/json'}});
     if(!r.ok)continue;const j=await r.json();const list=j.ac||j.aircraft;
-    if(list){aircraft=list.filter(a=>typeof a.lat==='number'&&typeof a.lon==='number');return;}}catch(e){}}
-  aircraft=[]; // silent — feed may be CORS-blocked; overlay still runs on sky bodies
+    if(list){aircraft=list.filter(a=>typeof a.lat==='number'&&typeof a.lon==='number');
+      diag.air=aircraft.length+' rx';renderDiag();return;}}catch(e){}}
+  aircraft=[];diag.air='blocked';renderDiag(); // CORS/network — overlay still runs on sky bodies
 }
 $('loadSat').addEventListener('click',async()=>{
   const url=$('tleUrl').value.trim();
@@ -272,9 +304,10 @@ $('loadSat').addEventListener('click',async()=>{
       try{const sr=satellite.twoline2satrec(lines[i+1],lines[i+2]);
         satrecs.push({name:lines[i].trim(),sr});}catch(e){}
     }
-    $('loadSat').textContent='Sats '+satrecs.length;
+    $('loadSat').textContent='Sats '+satrecs.length;diag.sat=satrecs.length+' ld';renderDiag();
     setStatus(satrecs.length+' satellites loaded.','ok');
   }catch(e){
+    diag.sat='blocked';renderDiag();
     setStatus('TLE load failed (likely CORS). Host a snapshot on your own Pages via Actions and paste that URL.','err');
   }
 });
