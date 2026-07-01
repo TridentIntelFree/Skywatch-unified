@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>SKYWATCH — unified sky instrument</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/satellite.js/5.0.0/satellite.min.js"></script>
+<style>
+  :root{
+    --bg:#080b11;--panel:#0d1219;--ink:#c3ccc4;--dim:#6a7770;--line:#1c2732;
+    --air:#5fd3bc;--sat:#8ab4ff;--sun:#ffd27f;--moon:#cfd6dd;--planet:#ffb347;
+    --hit:#ff6b6b;--lock:#5fd3bc;--alert:#ff6b6b;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;overflow:hidden}
+  #stage{position:fixed;inset:0;background:#000}
+  video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000}
+  #overlay{position:absolute;inset:0;width:100%;height:100%}
+  #proc{display:none}
+
+  header{position:absolute;top:0;left:0;right:0;z-index:5;pointer-events:none;
+    display:flex;align-items:baseline;gap:.5rem;padding:.5rem .7rem;
+    background:linear-gradient(180deg,rgba(8,11,17,.85),rgba(8,11,17,0))}
+  header h1{margin:0;font-size:.8rem;letter-spacing:.3em;font-weight:600}
+  header .sub{font-size:.54rem;letter-spacing:.15em;color:var(--dim);text-transform:uppercase}
+
+  #hud{position:absolute;top:.5rem;right:.7rem;z-index:5;text-align:right;
+    font-size:.6rem;line-height:1.5;color:var(--dim);text-shadow:0 0 5px #000;pointer-events:none}
+  #hud b{color:var(--ink);font-variant-numeric:tabular-nums;letter-spacing:.03em}
+
+  #dock{position:absolute;left:0;right:0;bottom:0;z-index:6;
+    background:linear-gradient(0deg,rgba(8,11,17,.95),rgba(8,11,17,.55) 75%,transparent);
+    padding:.55rem .7rem calc(.55rem + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:.5rem}
+  .btnrow{display:flex;gap:.4rem;flex-wrap:wrap}
+  button{font:inherit;font-size:.6rem;letter-spacing:.08em;text-transform:uppercase;
+    background:var(--panel);color:var(--ink);border:1px solid var(--line);
+    border-radius:.5rem;padding:.6rem .55rem;cursor:pointer;flex:1 1 auto}
+  button.primary{border-color:var(--lock);color:var(--lock)}
+  button:disabled{opacity:.4}
+  .sliders{display:flex;flex-direction:column;gap:.3rem}
+  .slide{display:flex;align-items:center;gap:.5rem;font-size:.54rem;color:var(--dim);
+    text-transform:uppercase;letter-spacing:.09em}
+  .slide label{width:5.6rem;flex:none}
+  .slide output{width:2.6rem;text-align:right;color:var(--ink);font-variant-numeric:tabular-nums}
+  input[type=range]{flex:1;accent-color:var(--planet)}
+  input[type=text]{flex:1;background:#0a0f16;border:1px solid var(--line);color:var(--ink);
+    font:inherit;font-size:.56rem;border-radius:.4rem;padding:.4rem .5rem}
+  #status{font-size:.58rem;color:var(--dim);line-height:1.4;min-height:1.3em}
+  #status.err{color:var(--alert)}#status.ok{color:var(--lock)}
+
+  #tabs{display:flex;gap:.3rem}
+  .tab{flex:1;text-align:center;font-size:.55rem;padding:.4rem;border:1px solid var(--line);
+    border-radius:.4rem;color:var(--dim);text-transform:uppercase;letter-spacing:.1em}
+  .tab[aria-selected="true"]{color:var(--ink);border-color:var(--lock)}
+  #sheet{max-height:34vh;overflow-y:auto;font-size:.58rem;line-height:1.55;display:none}
+  #sheet.open{display:block}
+  .obj{display:flex;justify-content:space-between;gap:.5rem;padding:.15rem 0;border-bottom:1px solid rgba(28,39,50,.5)}
+  .obj .nm{color:var(--ink)} .obj .v{color:var(--dim);font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+  .dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;margin-right:.35rem;vertical-align:middle}
+  #shot{position:absolute;z-index:7;left:.7rem;bottom:9rem;width:34vw;max-width:150px;border:1px solid var(--line);
+    border-radius:.4rem;display:none}
+  .hint{font-size:.5rem;color:var(--dim);letter-spacing:.08em}
+  @media (prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline muted></video>
+  <canvas id="overlay"></canvas>
+  <canvas id="proc" width="256" height="192"></canvas>
+</div>
+
+<header><h1>SKYWATCH</h1><span class="sub">unified · live sky over pixels</span></header>
+
+<div id="hud">
+  <div>BRG <b id="hBrg">—</b></div>
+  <div>ELV <b id="hElv">—</b></div>
+  <div>FOV <b id="hFov">63°</b></div>
+  <div>GPS <b id="hGps">—</b></div>
+  <div>AIR <b id="hAir">0</b> · SAT <b id="hSat">0</b></div>
+  <div>HITS <b id="hHit">0</b></div>
+</div>
+
+<img id="shot" alt="last capture">
+
+<div id="dock">
+  <div id="status">Grant location + camera, wave a figure-8 to calibrate the compass, then point at open sky.</div>
+
+  <div id="tabs">
+    <div class="tab" id="tabSky" aria-selected="true">Sky now</div>
+    <div class="tab" id="tabAn" aria-selected="false">Image data</div>
+  </div>
+  <div id="sheet" class="open"><div id="sheetBody" class="hint">Start the camera to populate.</div></div>
+
+  <div class="sliders">
+    <div class="slide"><label>Sensitivity</label><input type="range" id="sens" min="6" max="60" value="26"><output id="oSens">26</output></div>
+    <div class="slide"><label>Field of view</label><input type="range" id="fov" min="40" max="90" value="63"><output id="oFov">63°</output></div>
+    <div class="slide"><label>Heading trim</label><input type="range" id="trim" min="-40" max="40" value="0"><output id="oTrim">0°</output></div>
+    <div class="slide"><label>Sat TLE URL</label><input type="text" id="tleUrl" value="https://celestrak.org/NORAD/elements/gp.php?GROUP=visual&FORMAT=tle"></div>
+  </div>
+
+  <div class="btnrow">
+    <button id="start" class="primary">Start camera</button>
+    <button id="sensors">Compass</button>
+    <button id="loadSat">Load sats</button>
+    <button id="capture" disabled>Screenshot</button>
+  </div>
+</div>
+
+<script>
+/* ============================ math helpers ============================ */
+const D2R=Math.PI/180,R2D=180/Math.PI;
+const rev=a=>((a%360)+360)%360;
+const shortAngle=a=>{a=((a+180)%360+360)%360-180;return a;};
+const dayMs=86400000,J1970=2440588,J2000=2451545,ecl0=D2R*23.4397;
+const toJulian=d=>d.valueOf()/dayMs-0.5+J1970, toDays=d=>toJulian(d)-J2000;
+
+/* sun / moon (SunCalc core, azimuth measured from south) */
+const rightAsc=(l,b)=>Math.atan2(Math.sin(l)*Math.cos(ecl0)-Math.tan(b)*Math.sin(ecl0),Math.cos(l));
+const decl=(l,b)=>Math.asin(Math.sin(b)*Math.cos(ecl0)+Math.cos(b)*Math.sin(ecl0)*Math.sin(l));
+const azS=(H,phi,dec)=>Math.atan2(Math.sin(H),Math.cos(H)*Math.sin(phi)-Math.tan(dec)*Math.cos(phi));
+const altA=(H,phi,dec)=>Math.asin(Math.sin(phi)*Math.sin(dec)+Math.cos(phi)*Math.cos(dec)*Math.cos(H));
+const sidereal=(d,lw)=>D2R*(280.16+360.9856235*d)-lw;
+function sunCoords(d){const M=D2R*(357.5291+0.98560028*d);
+  const C=D2R*(1.9148*Math.sin(M)+0.02*Math.sin(2*M)+0.0003*Math.sin(3*M));
+  const L=M+C+D2R*102.9372+Math.PI;return{dec:decl(L,0),ra:rightAsc(L,0)};}
+function moonCoords(d){const L=D2R*(218.316+13.176396*d),M=D2R*(134.963+13.064993*d),F=D2R*(93.272+13.229350*d);
+  const l=L+D2R*6.289*Math.sin(M),b=D2R*5.128*Math.sin(F),dt=385001-20905*Math.cos(M);
+  return{ra:rightAsc(l,b),dec:decl(l,b),dist:dt};}
+function bodyAzAlt(coords,date,lat,lon){const lw=D2R*-lon,phi=D2R*lat,d=toDays(date),H=sidereal(d,lw)-coords.ra;
+  const azFromSouth=azS(H,phi,coords.dec)*R2D;
+  return{az:rev(180+azFromSouth),alt:altA(H,phi,coords.dec)*R2D};}
+function moonIllum(date){const d=toDays(date),s=sunCoords(d),m=moonCoords(d),sd=149598000;
+  const phi=Math.acos(Math.sin(s.dec)*Math.sin(m.dec)+Math.cos(s.dec)*Math.cos(m.dec)*Math.cos(s.ra-m.ra));
+  const inc=Math.atan2(sd*Math.sin(phi),m.dist-sd*Math.cos(phi));
+  const angle=Math.atan2(Math.cos(s.dec)*Math.sin(s.ra-m.ra),
+    Math.sin(s.dec)*Math.cos(m.dec)-Math.cos(s.dec)*Math.sin(m.dec)*Math.cos(s.ra-m.ra));
+  return{fraction:(1+Math.cos(inc))/2,phase:0.5+0.5*inc*(angle<0?-1:1)/Math.PI};}
+function phaseName(p){const n=["New","Waxing crescent","First quarter","Waxing gibbous","Full",
+  "Waning gibbous","Last quarter","Waning crescent"];return n[Math.round(p*8)%8];}
+
+/* planets — Schlyter low-precision (approx ±~1°) */
+function planetAzAlt(name,date,lat,lon){
+  const sd=toDays(date)+1.5;
+  const ws=282.9404+4.70935e-5*sd,es=0.016709-1.151e-9*sd,Ms=rev(356.0470+0.9856002585*sd);
+  let Es=Ms+R2D*es*Math.sin(Ms*D2R)*(1+es*Math.cos(Ms*D2R));
+  const xs=Math.cos(Es*D2R)-es,ys=Math.sqrt(1-es*es)*Math.sin(Es*D2R);
+  const rs=Math.hypot(xs,ys),vs=rev(Math.atan2(ys,xs)*R2D),lonsun=rev(vs+ws);
+  const xsun=rs*Math.cos(lonsun*D2R),ysun=rs*Math.sin(lonsun*D2R),ecl=23.4393-3.563e-7*sd;
+  const EL={
+    Venus:{N:76.6799+2.46590e-5*sd,i:3.3946+2.75e-8*sd,w:54.8910+1.38374e-5*sd,a:0.723330,e:0.006773-1.302e-9*sd,M:48.0052+1.6021302244*sd},
+    Mars:{N:49.5574+2.11081e-5*sd,i:1.8497-1.78e-8*sd,w:286.5016+2.92961e-5*sd,a:1.523688,e:0.093405+2.516e-9*sd,M:18.6021+0.5240207766*sd},
+    Jupiter:{N:100.4542+2.76854e-5*sd,i:1.3030-1.557e-7*sd,w:273.8777+1.64505e-5*sd,a:5.20256,e:0.048498+4.469e-9*sd,M:19.8950+0.0830853001*sd},
+    Saturn:{N:113.6634+2.38980e-5*sd,i:2.4886-1.081e-7*sd,w:339.3939+2.97661e-5*sd,a:9.55475,e:0.055546-9.499e-9*sd,M:316.9670+0.0334442282*sd}
+  }[name];
+  const N=EL.N,i=EL.i,w=EL.w,a=EL.a,e=EL.e,M=rev(EL.M);
+  let E=M+R2D*e*Math.sin(M*D2R)*(1+e*Math.cos(M*D2R));
+  for(let k=0;k<6;k++)E=E-(E-R2D*e*Math.sin(E*D2R)-M)/(1-e*Math.cos(E*D2R));
+  const xv=a*(Math.cos(E*D2R)-e),yv=a*Math.sqrt(1-e*e)*Math.sin(E*D2R);
+  const v=Math.atan2(yv,xv)*R2D,r=Math.hypot(xv,yv);
+  const xh=r*(Math.cos(N*D2R)*Math.cos((v+w)*D2R)-Math.sin(N*D2R)*Math.sin((v+w)*D2R)*Math.cos(i*D2R));
+  const yh=r*(Math.sin(N*D2R)*Math.cos((v+w)*D2R)+Math.cos(N*D2R)*Math.sin((v+w)*D2R)*Math.cos(i*D2R));
+  const zh=r*(Math.sin((v+w)*D2R)*Math.sin(i*D2R));
+  const xg=xh+xsun,yg=yh+ysun,zg=zh;
+  const xe=xg,ye=yg*Math.cos(ecl*D2R)-zg*Math.sin(ecl*D2R),ze=yg*Math.sin(ecl*D2R)+zg*Math.cos(ecl*D2R);
+  const RA=rev(Math.atan2(ye,xe)*R2D),Dec=Math.atan2(ze,Math.hypot(xe,ye))*R2D;
+  const Ls=rev(Ms+ws),gmst0=rev(Ls+180);
+  const UT=date.getUTCHours()+date.getUTCMinutes()/60+date.getUTCSeconds()/3600;
+  const LST=rev(gmst0+UT*15+lon),HA=rev(LST-RA);
+  const x1=Math.cos(HA*D2R)*Math.cos(Dec*D2R),y1=Math.sin(HA*D2R)*Math.cos(Dec*D2R),z1=Math.sin(Dec*D2R);
+  const xhor=x1*Math.sin(lat*D2R)-z1*Math.cos(lat*D2R),zhor=x1*Math.cos(lat*D2R)+z1*Math.sin(lat*D2R);
+  return{az:rev(Math.atan2(y1,xhor)*R2D+180),alt:Math.atan2(zhor,Math.hypot(xhor,y1))*R2D};
+}
+
+/* observer ECEF + look angles to a geodetic target (for aircraft) */
+function geoToEcef(lat,lon,h){const a=6378137,e2=6.69437999014e-3,s=Math.sin(lat*D2R),c=Math.cos(lat*D2R);
+  const N=a/Math.sqrt(1-e2*s*s);
+  return[(N+h)*c*Math.cos(lon*D2R),(N+h)*c*Math.sin(lon*D2R),(N*(1-e2)+h)*s];}
+function lookAngles(obsLat,obsLon,obs,tgt){
+  const dx=tgt[0]-obs[0],dy=tgt[1]-obs[1],dz=tgt[2]-obs[2];
+  const sLat=Math.sin(obsLat*D2R),cLat=Math.cos(obsLat*D2R),sLon=Math.sin(obsLon*D2R),cLon=Math.cos(obsLon*D2R);
+  const e=-sLon*dx+cLon*dy, n=-sLat*cLon*dx-sLat*sLon*dy+cLat*dz, u=cLat*cLon*dx+cLat*sLon*dy+sLat*dz;
+  return{az:rev(Math.atan2(e,n)*R2D),el:Math.atan2(u,Math.hypot(e,n))*R2D,range:Math.hypot(dx,dy,dz)};
+}
+
+/* ============================ state ============================ */
+const $=id=>document.getElementById(id);
+const video=$('cam'),overlay=$('overlay'),proc=$('proc'),
+      octx=overlay.getContext('2d'),pctx=proc.getContext('2d',{willReadFrequently:true});
+let me=null, heading=null, elevation=null, roll=0, running=false;
+let prev=null, hitCount=0, cooldown=0;
+let aircraft=[], satrecs=[], knowns=[];   // knowns: {name,az,el,color,kind}
+let lastCapture=null;
+
+function setStatus(t,c){const s=$('status');s.textContent=t;s.className=c||'';}
+function fit(){overlay.width=innerWidth;overlay.height=innerHeight;}
+addEventListener('resize',fit);fit();
+
+/* sliders */
+['sens','fov','trim'].forEach(id=>{const el=$(id),o=$('o'+id[0].toUpperCase()+id.slice(1));
+  const upd=()=>{o.textContent=el.value+(id==='sens'?'':'°'); if(id==='fov')$('hFov').textContent=el.value+'°';};
+  el.addEventListener('input',upd);upd();});
+
+/* tabs */
+$('tabSky').addEventListener('click',()=>switchTab('sky'));
+$('tabAn').addEventListener('click',()=>switchTab('an'));
+let tab='sky';
+function switchTab(t){tab=t;$('tabSky').setAttribute('aria-selected',t==='sky');
+  $('tabAn').setAttribute('aria-selected',t==='an');renderSheet();}
+
+/* ============================ geolocation ============================ */
+if(navigator.geolocation){
+  navigator.geolocation.watchPosition(p=>{
+    me={lat:p.coords.latitude,lon:p.coords.longitude,alt:p.coords.altitude||300};
+    $('hGps').textContent=me.lat.toFixed(3)+','+me.lon.toFixed(3);
+  },()=>{$('hGps').textContent='no fix';setStatus('No GPS — sky math needs your location. Enable location.','err');},
+  {enableHighAccuracy:true,maximumAge:15000,timeout:12000});
+}
+
+/* ============================ camera ============================ */
+$('start').addEventListener('click',async()=>{
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}},audio:false});
+    video.srcObject=s;await video.play();running=true;
+    $('start').textContent='Live';$('start').disabled=true;$('capture').disabled=false;
+    setStatus('Live. Sky data overlaid; moving lights flagged. No video is recorded — stills only.','ok');
+    requestAnimationFrame(loop);setInterval(refreshSky,4000);refreshSky();
+  }catch(e){setStatus('Camera blocked: '+e.message+' — needs HTTPS + permission.','err');}
+});
+
+/* ============================ orientation ============================ */
+$('sensors').addEventListener('click',async()=>{
+  try{
+    if(typeof DeviceOrientationEvent!=='undefined'&&DeviceOrientationEvent.requestPermission){
+      const p=await DeviceOrientationEvent.requestPermission();
+      if(p!=='granted'){setStatus('Motion denied — overlay needs compass to aim.','err');return;}
+    }
+    addEventListener('deviceorientation',onOrient);
+    $('sensors').textContent='Compass on';$('sensors').disabled=true;
+  }catch(e){setStatus('Compass unavailable here.','err');}
+});
+function onOrient(ev){
+  if(typeof ev.webkitCompassHeading==='number')heading=ev.webkitCompassHeading;
+  else if(typeof ev.alpha==='number')heading=rev(360-ev.alpha);
+  if(typeof ev.beta==='number')elevation=Math.max(-90,Math.min(90,ev.beta-90));
+  if(typeof ev.gamma==='number')roll=ev.gamma;
+  $('hBrg').textContent=heading==null?'—':Math.round(heading).toString().padStart(3,'0')+'°';
+  $('hElv').textContent=elevation==null?'—':Math.round(elevation)+'°';
+}
+
+/* ============================ data sources ============================ */
+async function loadAircraft(){
+  if(!me)return;
+  const urls=[
+    `https://api.airplanes.live/v2/point/${me.lat.toFixed(4)}/${me.lon.toFixed(4)}/100`,
+    `https://opendata.adsb.fi/api/v2/lat/${me.lat.toFixed(4)}/lon/${me.lon.toFixed(4)}/dist/100`];
+  for(const u of urls){try{const r=await fetch(u,{headers:{Accept:'application/json'}});
+    if(!r.ok)continue;const j=await r.json();const list=j.ac||j.aircraft;
+    if(list){aircraft=list.filter(a=>typeof a.lat==='number'&&typeof a.lon==='number');return;}}catch(e){}}
+  aircraft=[]; // silent — feed may be CORS-blocked; overlay still runs on sky bodies
+}
+$('loadSat').addEventListener('click',async()=>{
+  const url=$('tleUrl').value.trim();
+  try{
+    const r=await fetch(url);if(!r.ok)throw new Error('HTTP '+r.status);
+    const txt=await r.text();const lines=txt.split(/\r?\n/).filter(l=>l.trim().length);
+    satrecs=[];
+    for(let i=0;i+2<lines.length;i+=3){
+      if(typeof satellite==='undefined')break;
+      try{const sr=satellite.twoline2satrec(lines[i+1],lines[i+2]);
+        satrecs.push({name:lines[i].trim(),sr});}catch(e){}
+    }
+    $('loadSat').textContent='Sats '+satrecs.length;
+    setStatus(satrecs.length+' satellites loaded.','ok');
+  }catch(e){
+    setStatus('TLE load failed (likely CORS). Host a snapshot on your own Pages via Actions and paste that URL.','err');
+  }
+});
+
+/* recompute all known object az/el */
+function refreshSky(){
+  if(!me)return;
+  loadAircraft();
+  const now=new Date(),k=[];
+  const sun=bodyAzAlt(sunCoords(toDays(now)),now,me.lat,me.lon);
+  if(sun.alt>-2)k.push({name:'Sun',az:sun.az,el:sun.alt,color:'var(--sun)',kind:'sun'});
+  const moon=bodyAzAlt(moonCoords(toDays(now)),now,me.lat,me.lon),ill=moonIllum(now);
+  if(moon.alt>-2)k.push({name:`Moon ${Math.round(ill.fraction*100)}% ${phaseName(ill.phase)}`,
+    az:moon.az,el:moon.alt,color:'var(--moon)',kind:'moon'});
+  ['Venus','Mars','Jupiter','Saturn'].forEach(p=>{try{const pos=planetAzAlt(p,now,me.lat,me.lon);
+    if(pos.alt>0)k.push({name:p+' ~',az:pos.az,el:pos.alt,color:'var(--planet)',kind:'planet'});}catch(e){}});
+  const obs=geoToEcef(me.lat,me.lon,me.alt);
+  aircraft.forEach(a=>{const alt=(a.alt_baro==='ground'||a.alt_baro==null)?0:a.alt_baro*0.3048;
+    const la=lookAngles(me.lat,me.lon,obs,geoToEcef(a.lat,a.lon,alt));
+    if(la.el>0)k.push({name:(a.flight||a.hex||'ac').trim(),az:la.az,el:la.el,color:'var(--air)',kind:'air',
+      meta:`${Math.round(la.range/1000)}km`});});
+  let satUp=0;
+  if(satrecs.length){const gmst=satellite.gstime(now),gd={longitude:me.lon*D2R,latitude:me.lat*D2R,height:me.alt/1000};
+    satrecs.forEach(s=>{try{const pv=satellite.propagate(s.sr,now);if(!pv.position)return;
+      const ecf=satellite.eciToEcf(pv.position,gmst),la=satellite.ecfToLookAngles(gd,ecf);
+      const el=la.elevation*R2D;if(el>0){satUp++;
+        k.push({name:s.name,az:rev(la.azimuth*R2D),el,color:'var(--sat)',kind:'sat',
+          meta:`${Math.round(la.rangeSat)}km`});}}catch(e){}});}
+  knowns=k;
+  $('hAir').textContent=k.filter(o=>o.kind==='air').length;
+  $('hSat').textContent=satUp;
+  renderSheet();
+}
+
+/* ============================ projection + overlay ============================ */
+function project(az,el){
+  if(heading==null||elevation==null)return null;
+  const fov=+$('fov').value, trim=+$('trim').value;
+  const cAz=rev(heading+trim), cEl=elevation;
+  let dAz=shortAngle(az-cAz)*Math.cos(cEl*D2R), dEl=el-cEl;
+  const fovY=fov*overlay.height/overlay.width;
+  let nx=dAz/(fov/2), ny=-dEl/(fovY/2);
+  const rr=-roll*D2R, cx=nx*Math.cos(rr)-ny*Math.sin(rr), cy=nx*Math.sin(rr)+ny*Math.cos(rr);
+  if(Math.abs(cx)>1.15||Math.abs(cy)>1.15)return null;
+  return{x:overlay.width/2+cx*overlay.width/2, y:overlay.height/2+cy*overlay.height/2};
+}
+function drawOverlay(){
+  octx.clearRect(0,0,overlay.width,overlay.height);
+  // center reticle
+  octx.strokeStyle='rgba(95,211,188,.25)';octx.lineWidth=1;
+  octx.beginPath();octx.moveTo(overlay.width/2-14,overlay.height/2);octx.lineTo(overlay.width/2+14,overlay.height/2);
+  octx.moveTo(overlay.width/2,overlay.height/2-14);octx.lineTo(overlay.width/2,overlay.height/2+14);octx.stroke();
+  knowns.forEach(o=>{const p=project(o.az,o.el);if(!p)return;
+    const col=getComputedStyle(document.documentElement).getPropertyValue(o.color.replace('var(','').replace(')',''))||'#fff';
+    octx.strokeStyle=col;octx.fillStyle=col;octx.lineWidth=1.5;
+    octx.beginPath();octx.arc(p.x,p.y,o.kind==='sun'||o.kind==='moon'?13:8,0,7);octx.stroke();
+    octx.font='10px ui-monospace';octx.fillText(o.name,p.x+11,p.y+3);});
+}
+
+/* ============================ detection loop ============================ */
+const GW=proc.width,GH=proc.height,NPX=GW*GH;
+function loop(){
+  if(!running)return;
+  pctx.drawImage(video,0,0,GW,GH);
+  const cur=pctx.getImageData(0,0,GW,GH).data,gray=new Float32Array(NPX);
+  for(let i=0,p=0;i<NPX;i++,p+=4)gray[i]=cur[p]*0.299+cur[p+1]*0.587+cur[p+2]*0.114;
+  drawOverlay();
+  if(prev){
+    const thr=+$('sens').value;let changed=0,best=-1,bx=0,by=0;
+    for(let y=0;y<GH;y++)for(let x=0;x<GW;x++){const i=y*GW+x,d=gray[i]-prev[i];
+      if(d>thr&&gray[i]>70){changed++;if(d>best){best=d;bx=x;by=y;}}}
+    if(cooldown>0)cooldown--;
+    if(best>0&&changed/NPX<0.03){
+      const s=Math.max(overlay.width/GW,overlay.height/GH);
+      const ox=(overlay.width-GW*s)/2,oy=(overlay.height-GH*s)/2,px=ox+bx*s,py=oy+by*s;
+      octx.strokeStyle=changed/NPX<0.006?'#ff6b6b':'#ffb347';octx.lineWidth=2;
+      octx.beginPath();octx.arc(px,py,17,0,7);octx.stroke();
+      if(cooldown===0){hitCount++;$('hHit').textContent=hitCount;cooldown=25;}
+    }
+  }
+  prev=gray;requestAnimationFrame(loop);
+}
+
+/* ============================ screenshot (still only) ============================ */
+$('capture').addEventListener('click',()=>{
+  const cap=document.createElement('canvas');cap.width=overlay.width;cap.height=overlay.height;
+  const cx=cap.getContext('2d');
+  const vw=video.videoWidth,vh=video.videoHeight;
+  if(vw&&vh){const s=Math.max(cap.width/vw,cap.height/vh);
+    cx.drawImage(video,(cap.width-vw*s)/2,(cap.height-vh*s)/2,vw*s,vh*s);}
+  cx.drawImage(overlay,0,0);
+  lastCapture=cap;
+  const url=cap.toDataURL('image/png');
+  const img=$('shot');img.src=url;img.style.display='block';
+  const a=document.createElement('a');a.href=url;a.download='skywatch-'+Date.now()+'.png';a.click();
+  analyze(cap);switchTab('an');
+  setStatus('Still saved. Long-press the thumbnail to keep it. Image data extracted below.','ok');
+});
+
+/* ============================ image analysis ============================ */
+let analysis=null;
+function analyze(cap){
+  const AW=256,AH=Math.round(256*cap.height/cap.width);
+  const c=document.createElement('canvas');c.width=AW;c.height=AH;
+  const ctx=c.getContext('2d',{willReadFrequently:true});ctx.drawImage(cap,0,0,AW,AH);
+  const d=ctx.getImageData(0,0,AW,AH).data;
+  let sum=0;const lum=new Float32Array(AW*AH);
+  for(let i=0,p=0;i<AW*AH;i++,p+=4){const L=d[p]*0.299+d[p+1]*0.587+d[p+2]*0.114;lum[i]=L;sum+=L;}
+  const mean=sum/(AW*AH), thr=Math.max(mean+45,150);
+  // local maxima above threshold
+  const pts=[];
+  for(let y=1;y<AH-1;y++)for(let x=1;x<AW-1;x++){const i=y*AW+x,L=lum[i];
+    if(L<thr)continue;
+    if(L>=lum[i-1]&&L>=lum[i+1]&&L>=lum[i-AW]&&L>=lum[i+AW]){
+      const p=(y*AW+x)*4;pts.push({x,y,L,r:d[p],g:d[p+1],b:d[p+2]});}}
+  // dedupe near-duplicates
+  pts.sort((a,b)=>b.L-a.L);const keep=[];
+  pts.forEach(pt=>{if(!keep.some(k=>Math.abs(k.x-pt.x)<4&&Math.abs(k.y-pt.y)<4))keep.push(pt);});
+  const top=keep.slice(0,12);
+  // pixel -> az/el using pointing at capture time
+  const fov=+$('fov').value,fovY=fov*AH/AW,trim=+$('trim').value;
+  const cAz=heading==null?null:rev(heading+trim),cEl=elevation;
+  top.forEach(pt=>{
+    const nx=(pt.x/AW*2-1), ny=(pt.y/AH*2-1);
+    const rr=roll*D2R, ux=nx*Math.cos(rr)-ny*Math.sin(rr), uy=nx*Math.sin(rr)+ny*Math.cos(rr);
+    if(cAz==null){pt.az=null;pt.el=null;return;}
+    pt.az=rev(cAz+ux*(fov/2)/Math.max(.2,Math.cos(cEl*D2R)));
+    pt.el=cEl-uy*(fovY/2);
+    // match to knowns within 6°
+    let bestM=null,bd=6;
+    knowns.forEach(o=>{const da=shortAngle(o.az-pt.az),de=o.el-pt.el,dist=Math.hypot(da,de);
+      if(dist<bd){bd=dist;bestM=o;}});
+    pt.match=bestM?bestM.name:'UNMATCHED';pt.matchKind=bestM?bestM.kind:'unknown';
+  });
+  analysis={mean:mean.toFixed(1),count:top.length,pts:top,
+    when:new Date().toLocaleTimeString(),
+    gps:me?`${me.lat.toFixed(4)}, ${me.lon.toFixed(4)}`:'—',
+    aim:cAz==null?'—':`${Math.round(cAz)}° / ${Math.round(cEl)}°`,
+    moon:(()=>{const il=moonIllum(new Date());return `${Math.round(il.fraction*100)}% ${phaseName(il.phase)}`;})()};
+}
+
+/* ============================ panels ============================ */
+function cssColor(v){return getComputedStyle(document.documentElement).getPropertyValue(v.replace('var(','').replace(')',''))||'#fff';}
+function renderSheet(){
+  const b=$('sheetBody');
+  if(tab==='sky'){
+    if(!knowns.length){b.innerHTML='<div class="hint">No objects above horizon yet, or waiting on GPS.</div>';return;}
+    const order={sun:0,moon:1,planet:2,sat:3,air:4};
+    const rows=[...knowns].sort((a,b)=>(order[a.kind]-order[b.kind])||b.el-a.el).map(o=>
+      `<div class="obj"><span class="nm"><span class="dot" style="background:${cssColor(o.color)}"></span>${o.name}</span>`+
+      `<span class="v">az ${Math.round(o.az)}° · el ${Math.round(o.el)}°${o.meta?' · '+o.meta:''}</span></div>`).join('');
+    b.innerHTML=rows;
+  } else {
+    if(!analysis){b.innerHTML='<div class="hint">Take a screenshot to extract point sources, their az/el, colour, and known-object matches.</div>';return;}
+    const head=`<div class="hint">${analysis.when} · GPS ${analysis.gps} · aim ${analysis.aim} · sky glow ${analysis.mean} · moon ${analysis.moon} · ${analysis.count} point sources</div>`;
+    const rows=analysis.pts.map((p,i)=>{
+      const azel=p.az==null?'—':`az ${Math.round(p.az)}° · el ${Math.round(p.el)}°`;
+      const col=`rgb(${p.r},${p.g},${p.b})`;
+      const tag=p.match==='UNMATCHED'?'<b style="color:var(--hit)">UNMATCHED</b>':p.match;
+      return `<div class="obj"><span class="nm"><span class="dot" style="background:${col}"></span>#${i+1} ${tag}</span>`+
+        `<span class="v">${azel} · L${Math.round(p.L)}</span></div>`;}).join('');
+    b.innerHTML=head+rows;
+  }
+}
+</script>
+</body>
+</html>
