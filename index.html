@@ -74,7 +74,7 @@
   <canvas id="proc" width="256" height="192"></canvas>
 </div>
 
-<header><h1>SKYWATCH</h1><span class="sub">unified v2 · full sky over pixels</span></header>
+<header><h1>SKYWATCH</h1><span class="sub">unified v2.1 · full sky over pixels</span></header>
 
 <div id="hud">
   <div>BRG <b id="hBrg">—</b></div>
@@ -101,6 +101,7 @@
     <button class="tog" id="tLines" data-on="1">Lines</button>
     <button class="tog" id="tDeep" data-on="0">Deep sky</button>
     <button class="tog" id="tRad" data-on="1">Meteors</button>
+    <button class="tog" id="tDebris" data-on="0">Debris</button>
   </div>
 
   <div class="sliders">
@@ -125,6 +126,233 @@
 </div>
 
 <script>
+/* ============================================================
+ SKYWATCH SATENGINE v1 — full-catalog SGP4 engine
+ Propagates the entire public GP catalog in a Web Worker built
+ from a Blob. Coarse sweep culls to above-horizon set; fine
+ sweep updates the visible set; main thread lerps frames.
+ Feeds catalog.json produced by the Space-Track GitHub Action.
+ ============================================================ */
+const SATENGINE = (() => {
+  // ---------- tunables ----------
+  const SWEEP_MS = 10000;   // full-catalog coarse sweep period
+  const FINE_MS  = 300;     // visible-set update period
+  const CHUNK    = 3000;    // objects per coarse chunk
+  const MIN_EL_DEG = -2.0;  // keep slightly-below-horizon so risers appear smoothly
+
+  // ---------- worker source ----------
+  const WORKER_SRC = `
+  importScripts('https://cdnjs.cloudflare.com/ajax/libs/satellite.js/5.0.0/satellite.min.js');
+  const DEG = Math.PI/180, R_EARTH = 6371.0;
+  let sats = [];        // {name, norad, type, rec, dead}
+  let obs = null;       // satellite.js geodetic {latitude, longitude, height(km)}
+  let visIdx = [];      // indices of above-horizon objects
+  let running = false;
+  let sweepTimer = null, fineTimer = null;
+  const minEl = ${MIN_EL_DEG} * DEG;
+
+  // --- low-precision solar position, ECI/TEME km (Schlyter) ---
+  function sunEci(date){
+    const jd = (date.getTime()/86400000) + 2440587.5;
+    const d  = jd - 2451545.0;
+    const g  = (357.529 + 0.98560028*d) * DEG;   // mean anomaly
+    const q  = (280.459 + 0.98564736*d) * DEG;   // mean longitude
+    const L  = q + (1.915*Math.sin(g) + 0.020*Math.sin(2*g)) * DEG; // ecliptic lon
+    const e  = (23.439 - 0.00000036*d) * DEG;    // obliquity
+    const rAU= 1.00014 - 0.01671*Math.cos(g) - 0.00014*Math.cos(2*g);
+    const r  = rAU * 149597870.7;
+    return { x: r*Math.cos(L),
+             y: r*Math.cos(e)*Math.sin(L),
+             z: r*Math.sin(e)*Math.sin(L) };
+  }
+  // Shadow-cylinder test: sunlit unless behind Earth relative to Sun
+  function isSunlit(p, sun){
+    const sm = Math.hypot(sun.x, sun.y, sun.z);
+    const ux = sun.x/sm, uy = sun.y/sm, uz = sun.z/sm;
+    const dot = p.x*ux + p.y*uy + p.z*uz;
+    if (dot > 0) return true;                       // sun side
+    const r2 = p.x*p.x + p.y*p.y + p.z*p.z;
+    return (r2 - dot*dot) > R_EARTH*R_EARTH;        // outside shadow cylinder
+  }
+  function lookAngles(rec, date, gmst, sun){
+    const pv = satellite.propagate(rec, date);
+    if (!pv || !pv.position) return null;
+    const ecf = satellite.eciToEcf(pv.position, gmst);
+    const la  = satellite.ecfToLookAngles(obs, ecf);
+    return { az: la.azimuth, el: la.elevation,
+             rng: la.rangeSat, lit: isSunlit(pv.position, sun) };
+  }
+  // --- chunked coarse sweep over the full catalog ---
+  function coarseSweep(){
+    if (!running || !obs) return;
+    const date = new Date();
+    const gmst = satellite.gstime(date);
+    const sun  = sunEci(date);
+    const found = [];
+    let i = 0;
+    (function chunk(){
+      const end = Math.min(i + ${CHUNK}, sats.length);
+      for (; i < end; i++){
+        const s = sats[i];
+        if (s.dead) continue;
+        const la = lookAngles(s.rec, date, gmst, sun);
+        if (!la){ s.dead = true; continue; }
+        if (la.el > minEl) found.push(i);
+      }
+      if (i < sats.length){ setTimeout(chunk, 0); }
+      else {
+        visIdx = found;
+        postMessage({ type:'sweep', visible: found.length,
+          total: sats.length, dead: sats.filter(s=>s.dead).length });
+      }
+    })();
+  }
+  // --- fine sweep over visible set only ---
+  function fineSweep(){
+    if (!running || !obs || visIdx.length === 0) return;
+    const date = new Date();
+    const gmst = satellite.gstime(date);
+    const sun  = sunEci(date);
+    const n = visIdx.length;
+    const idx = new Int32Array(n);
+    const az  = new Float32Array(n);
+    const el  = new Float32Array(n);
+    const rng = new Float32Array(n);
+    const flg = new Uint8Array(n);   // bit0 sunlit
+    let k = 0;
+    for (let j = 0; j < n; j++){
+      const s = sats[visIdx[j]];
+      const la = lookAngles(s.rec, date, gmst, sun);
+      if (!la) continue;
+      idx[k] = visIdx[j];
+      az[k] = la.az; el[k] = la.el; rng[k] = la.rng;
+      flg[k] = la.lit ? 1 : 0;
+      k++;
+    }
+    postMessage({ type:'frame', t: date.getTime(), n: k,
+      idx, az, el, rng, flg },
+      [idx.buffer, az.buffer, el.buffer, rng.buffer, flg.buffer]);
+  }
+  onmessage = (e) => {
+    const m = e.data;
+    if (m.type === 'init'){
+      const cat = JSON.parse(m.catalog);
+      const src = cat.sats;
+      sats = new Array(src.length);
+      let i = 0;
+      (function build(){
+        const end = Math.min(i + ${CHUNK}, src.length);
+        for (; i < end; i++){
+          const [name, norad, type, l1, l2] = src[i];
+          let rec = null;
+          try { rec = satellite.twoline2satrec(l1, l2); } catch(_) {}
+          sats[i] = { name, norad, type, rec, dead: !rec };
+        }
+        postMessage({ type:'progress', loaded: i, total: src.length });
+        if (i < src.length){ setTimeout(build, 0); }
+        else {
+          // meta table sent once; frames reference it by index
+          postMessage({ type:'ready', count: sats.length,
+            meta: sats.map(s => [s.name, s.norad, s.type]) });
+        }
+      })();
+    }
+    else if (m.type === 'observer'){
+      obs = { latitude: m.lat*DEG, longitude: m.lon*DEG, height: (m.alt||0)/1000 };
+      if (running) coarseSweep();
+    }
+    else if (m.type === 'start'){
+      if (running) return;
+      running = true;
+      coarseSweep();
+      sweepTimer = setInterval(coarseSweep, ${SWEEP_MS});
+      fineTimer  = setInterval(fineSweep, ${FINE_MS});
+    }
+    else if (m.type === 'stop'){
+      running = false; clearInterval(sweepTimer); clearInterval(fineTimer);
+    }
+  };
+  `;
+
+  // ---------- main-thread state ----------
+  let worker = null;
+  let meta = [];                    // [name, norad, type] by catalog index
+  let frameA = null, frameB = null; // last two fine frames for lerp
+  let cbs = {};
+  let stats = { total: 0, visible: 0, dead: 0, generated: null };
+
+  function handleMsg(e){
+    const m = e.data;
+    if (m.type === 'progress'){ cbs.onProgress && cbs.onProgress(m.loaded, m.total); }
+    else if (m.type === 'ready'){
+      meta = m.meta; stats.total = m.count;
+      cbs.onReady && cbs.onReady(m.count);
+    }
+    else if (m.type === 'sweep'){
+      stats.visible = m.visible; stats.dead = m.dead;
+    }
+    else if (m.type === 'frame'){
+      frameA = frameB; frameB = m;
+    }
+  }
+  function lerpAngle(a, b, f){
+    let d = b - a;
+    if (d >  Math.PI) d -= 2*Math.PI;
+    if (d < -Math.PI) d += 2*Math.PI;
+    return a + d*f;
+  }
+  return {
+    init(opts){
+      cbs = opts || {};
+      fetch(opts.catalogUrl || 'catalog.json')
+        .then(r => { if (!r.ok) throw new Error('catalog fetch ' + r.status); return r.text(); })
+        .then(text => {
+          try { stats.generated = JSON.parse(text).generated; } catch(_){}
+          worker = new Worker(URL.createObjectURL(
+            new Blob([WORKER_SRC], { type:'application/javascript' })));
+          worker.onmessage = handleMsg;
+          worker.onerror = ev => cbs.onError && cbs.onError(ev.message);
+          worker.postMessage({ type:'init', catalog: text });
+        })
+        .catch(err => cbs.onError && cbs.onError(String(err)));
+    },
+    setObserver(lat, lon, altMeters){
+      worker && worker.postMessage({ type:'observer', lat, lon, alt: altMeters });
+    },
+    start(){ worker && worker.postMessage({ type:'start' }); },
+    stop(){ worker && worker.postMessage({ type:'stop' }); },
+    stats(){ return stats; },
+    /* getVisible(tMillis) -> array of
+       {norad, name, type:'P|R|D|U', az, el, rangeKm, sunlit}
+       az/el in RADIANS; lerped between the two most recent frames. */
+    getVisible(t){
+      if (!frameB) return [];
+      const A = frameA, B = frameB;
+      let f = 1;
+      if (A && B.t > A.t) f = Math.min(Math.max((t - A.t)/(B.t - A.t), 0), 1.5);
+      const out = new Array(B.n);
+      let mapA = null;
+      if (A){
+        mapA = new Map();
+        for (let j = 0; j < A.n; j++) mapA.set(A.idx[j], j);
+      }
+      for (let j = 0; j < B.n; j++){
+        const ci = B.idx[j];
+        const mm = meta[ci] || ['?','?','U'];
+        let az = B.az[j], el = B.el[j];
+        if (mapA && mapA.has(ci)){
+          const k = mapA.get(ci);
+          az = lerpAngle(A.az[k], B.az[j], f);
+          el = A.el[k] + (B.el[j] - A.el[k]) * f;
+        }
+        out[j] = { norad: mm[1], name: mm[0], type: mm[2],
+                   az, el, rangeKm: B.rng[j], sunlit: !!(B.flg[j] & 1) };
+      }
+      return out;
+    }
+  };
+})();
+
 /* ============================ math helpers ============================ */
 const D2R=Math.PI/180,R2D=180/Math.PI;
 const rev=a=>((a%360)+360)%360;
@@ -354,6 +582,15 @@ let prev=null, hitCount=0, cooldown=0;
 let aircraft=[], satrecs=[], knowns=[];   // knowns: {name,az,el,color,kind}
 let starsUp=[], dsoUp=[], radUp=[];       // fixed-sky layers, refreshed with knowns
 let lastCapture=null;
+let engineReady=false, engCache={t:0,objs:[]};   // SATENGINE state
+
+/* throttled read of the engine's visible set (~8 Hz; engine lerps internally) */
+function engineVisible(){
+  if(!engineReady)return [];
+  const now=Date.now();
+  if(now-engCache.t>120){engCache={t:now,objs:SATENGINE.getVisible(now)};}
+  return engCache.objs;
+}
 
 function setStatus(t,c){const s=$('status');s.textContent=t;s.className=c||'';}
 function fit(){overlay.width=innerWidth;overlay.height=innerHeight;}
@@ -367,7 +604,7 @@ addEventListener('resize',fit);fit();
   el.addEventListener('input',upd);upd();});
 
 /* layer toggles */
-const tog={stars:$('tStars'),lines:$('tLines'),deep:$('tDeep'),rad:$('tRad')};
+const tog={stars:$('tStars'),lines:$('tLines'),deep:$('tDeep'),rad:$('tRad'),debris:$('tDebris')};
 Object.values(tog).forEach(b=>b.addEventListener('click',()=>{
   b.dataset.on=b.dataset.on==='1'?'0':'1';renderSheet();}));
 const on=k=>tog[k].dataset.on==='1';
@@ -393,6 +630,7 @@ function applyPos(p){
   me={lat:p.coords.latitude,lon:p.coords.longitude,alt:p.coords.altitude||300};
   diag.gps='ok';$('hGps').textContent=me.lat.toFixed(3)+','+me.lon.toFixed(3);
   $('geo').textContent='Located';renderDiag();refreshSky();
+  SATENGINE.setObserver(me.lat,me.lon,me.alt);
 }
 $('geo').addEventListener('click',()=>{
   if(!navigator.geolocation){diag.gps='no api';renderDiag();
@@ -410,6 +648,7 @@ $('manual').addEventListener('change',e=>{
   if(m.length===2&&isFinite(m[0])&&isFinite(m[1])){
     me={lat:m[0],lon:m[1],alt:300};diag.gps='manual';
     $('hGps').textContent=me.lat.toFixed(3)+','+me.lon.toFixed(3);renderDiag();refreshSky();
+    SATENGINE.setObserver(me.lat,me.lon,me.alt);
     setStatus('Manual location set — aircraft and sky now computed from it.','ok');
   } else setStatus('Format: lat,lon  (e.g. 36.90,-82.00)','err');
 });
@@ -543,7 +782,7 @@ function refreshSky(){
     radUp.push({name:s[0],az:p.az,el:p.alt,peak:s[5],zhr:s[6],up:p.alt>0});});
 
   $('hAir').textContent=k.filter(o=>o.kind==='air').length;
-  $('hSat').textContent=satUp;
+  $('hSat').textContent=engineReady?SATENGINE.stats().visible:satUp;
   $('hStr').textContent=starsUp.filter(s=>s.mag<=lim&&s.el>0).length;
   renderSheet();
 }
@@ -605,6 +844,37 @@ function drawOverlay(){
     radUp.forEach(rp=>{if(!rp.up)return;const p=project(rp.az,rp.el);if(!p)return;
       octx.beginPath();octx.moveTo(p.x,p.y-8);octx.lineTo(p.x+8,p.y);octx.lineTo(p.x,p.y+8);octx.lineTo(p.x-8,p.y);octx.closePath();octx.stroke();
       octx.font='9px ui-monospace';octx.fillText(rp.name+' radiant',p.x+10,p.y+3);});
+  }
+
+  /* full-catalog satellites from SATENGINE (payloads bright when sunlit; junk on Debris toggle) */
+  if(engineReady){
+    const objs=engineVisible();
+    let labels=0;
+    const satCol=cssColor('var(--sat)');
+    objs.forEach(o=>{
+      const elD=o.el*R2D;if(elD<0)return;
+      const azD=rev(o.az*R2D);
+      const isJunk=o.type!=='P';
+      if(isJunk){
+        if(!on('debris'))return;
+        const p=project(azD,elD);if(!p)return;
+        octx.fillStyle='rgba(120,130,145,.45)';
+        octx.beginPath();octx.arc(p.x,p.y,1.3,0,7);octx.fill();
+        return;
+      }
+      const p=project(azD,elD);if(!p)return;
+      if(o.sunlit){
+        octx.fillStyle=satCol;
+        octx.beginPath();octx.arc(p.x,p.y,2.6,0,7);octx.fill();
+        if(labels<16){
+          octx.font='9px ui-monospace';octx.fillStyle='rgba(138,180,255,.8)';
+          octx.fillText(o.name,p.x+5,p.y-3);labels++;
+        }
+      }else{
+        octx.fillStyle='rgba(138,180,255,.28)';
+        octx.beginPath();octx.arc(p.x,p.y,1.6,0,7);octx.fill();
+      }
+    });
   }
 
   // center reticle
@@ -681,8 +951,11 @@ function analyze(cap){
   // pixel -> az/el using pointing at capture time
   const fov=+$('fov').value,fovY=fov*AH/AW,trim=+$('trim').value;
   const cAz=heading==null?null:rev(heading+trim),cEl=elevation;
-  // candidate set for matching: dynamic knowns + stars + deep sky
-  const cands=knowns.concat(
+  // candidate set for matching: dynamic knowns + full-catalog sats + stars + deep sky
+  const engC=engineVisible()
+    .filter(o=>o.el*R2D>0&&(o.type==='P'||on('debris')))
+    .map(o=>({name:o.name,az:rev(o.az*R2D),el:o.el*R2D,kind:'sat'}));
+  const cands=knowns.concat(engC,
     starsUp.filter(s=>s.mag<=+$('smag').value+0.5).map(s=>({name:s.name,az:s.az,el:s.el,kind:'star'})),
     dsoUp.map(o=>({name:o.name,az:o.az,el:o.el,kind:'dso'})));
   top.forEach(pt=>{
@@ -714,6 +987,16 @@ function renderSheet(){
     let html=[...knowns].sort((a,b)=>(order[a.kind]-order[b.kind])||b.el-a.el).map(o=>
       `<div class="obj"><span class="nm"><span class="dot" style="background:${cssColor(o.color)}"></span>${o.name}</span>`+
       `<span class="v">az ${Math.round(o.az)}° · el ${Math.round(o.el)}°${o.meta?' · '+o.meta:''}</span></div>`).join('');
+    /* full-catalog engine summary + brightest sunlit payloads overhead */
+    if(engineReady){
+      const st=SATENGINE.stats();
+      const eng=engineVisible().filter(o=>o.type==='P'&&o.sunlit&&o.el*R2D>0)
+        .sort((a,b)=>a.rangeKm-b.rangeKm).slice(0,8);
+      html+=eng.map(o=>
+        `<div class="obj"><span class="nm"><span class="dot" style="background:var(--sat)"></span>${o.name}</span>`+
+        `<span class="v">az ${Math.round(rev(o.az*R2D))}° · el ${Math.round(o.el*R2D)}° · ${Math.round(o.rangeKm)}km ☀</span></div>`).join('');
+      html+=`<div class="hint" style="padding:.25rem 0">⬤ ${st.visible} catalog objects above horizon of ${st.total}${stats_gen()}</div>`;
+    }
     /* brightest stars currently up */
     const lim=+$('smag').value;
     const bright=starsUp.filter(s=>s.el>0&&s.mag<=lim).sort((a,b)=>a.mag-b.mag).slice(0,8);
@@ -740,6 +1023,28 @@ function renderSheet(){
     b.innerHTML=head+rows;
   }
 }
+function stats_gen(){
+  const g=SATENGINE.stats().generated;
+  if(!g)return'';
+  try{const h=Math.round((Date.now()-new Date(g).getTime())/3600000);
+    return ` · TLEs ${h}h old`;}catch(_){return'';}
+}
+
+/* ============================ SATENGINE boot ============================ */
+SATENGINE.init({
+  catalogUrl:'catalog.json',
+  onProgress:(l,t)=>{diag.sat='cat '+Math.round(100*l/t)+'%';renderDiag();},
+  onReady:(c)=>{
+    engineReady=true;diag.sat=c+' cat';renderDiag();
+    if(me)SATENGINE.setObserver(me.lat,me.lon,me.alt||300);
+    SATENGINE.start();
+    setStatus(c+' catalog objects tracking. Sunlit payloads drawn bright; tap Debris for rocket bodies + junk.','ok');
+  },
+  onError:(m)=>{
+    diag.sat='no cat';renderDiag();
+    setStatus('catalog.json not found — run the Space-Track Action first. CelesTrak "Load sats" still works meanwhile.','err');
+  }
+});
 </script>
 </body>
 </html>
