@@ -1,0 +1,35 @@
+name: Fetch Space-Track TLEs
+on:
+  schedule:
+    - cron: '17 */8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch TLEs
+        env:
+          ST_USER: ${{ secrets.SPACETRACK_USER }}
+          ST_PASS: ${{ secrets.SPACETRACK_PASS }}
+        run: |
+          QUERY="https://www.space-track.org/basicspacedata/query/class/gp/decay_date/null-val/epoch/>now-30/object_type/PAYLOAD/rcs_size/Large/orderby/NORAD_CAT_ID/format/json"
+          curl -s https://www.space-track.org/ajaxauth/login \
+            --data-urlencode "identity=$ST_USER" \
+            --data-urlencode "password=$ST_PASS" \
+            --data-urlencode "query=$QUERY" \
+            -o tles.json
+          head -c 1 tles.json | grep -q '\[' || { echo "Fetch failed:"; cat tles.json; exit 1; }
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add tles.json
+          git diff --cached --quiet || git commit -m "TLE update $(date -u +%F_%H:%M)"
+          git push
