@@ -18,13 +18,15 @@ jobs:
           ST_USER: ${{ secrets.SPACETRACK_USER }}
           ST_PASS: ${{ secrets.SPACETRACK_PASS }}
         run: |
-          QUERY="https://www.space-track.org/basicspacedata/query/class/gp/decay_date/null-val/epoch/>now-30/orderby/NORAD_CAT_ID/format/json"
-          curl -s https://www.space-track.org/ajaxauth/login \
+          curl -s -c cookies.txt https://www.space-track.org/ajaxauth/login \
             --data-urlencode "identity=$ST_USER" \
             --data-urlencode "password=$ST_PASS" \
-            --data-urlencode "query=$QUERY" \
+            -o login.json
+          grep -qi failed login.json && { echo "Login failed:"; cat login.json; exit 1; } || true
+          curl -s -b cookies.txt \
+            "https://www.space-track.org/basicspacedata/query/class/gp/decay_date/null-val/epoch/%3Enow-30/orderby/NORAD_CAT_ID/format/json" \
             -o raw.json
-          head -c 1 raw.json | grep -q '\[' || { echo "Fetch failed:"; cat raw.json; exit 1; }
+          head -c 1 raw.json | grep -q '\[' || { echo "Fetch failed:"; head -c 500 raw.json; exit 1; }
 
       - name: Convert to catalog.json
         run: |
@@ -36,7 +38,8 @@ jobs:
               elif .OBJECT_TYPE=="DEBRIS" then "D"
               else "U" end),
              .TLE_LINE1, .TLE_LINE2]]}' raw.json > catalog.json
-          rm raw.json
+          rm raw.json cookies.txt login.json
+          ls -la catalog.json
 
       - name: Commit
         run: |
