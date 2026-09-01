@@ -93,6 +93,7 @@
   <div id="tabs">
     <div class="tab" id="tabSky" aria-selected="true">Sky now</div>
     <div class="tab" id="tabAn" aria-selected="false">Image data</div>
+    <div class="tab" id="tabLock" aria-selected="false">Lock</div>
   </div>
   <div id="sheet" class="open"><div id="sheetBody" class="hint">Start the camera to populate.</div></div>
 
@@ -121,6 +122,7 @@
     <button id="start" class="primary">Camera</button>
     <button id="sensors">Compass</button>
     <button id="loadSat">Load sats</button>
+    <button id="lock" disabled>Lock</button>
     <button id="capture" disabled>Shot</button>
   </div>
 </div>
@@ -336,17 +338,24 @@ const SATENGINE = (() => {
         mapA = new Map();
         for (let j = 0; j < A.n; j++) mapA.set(A.idx[j], j);
       }
+      const dtS = A ? (B.t - A.t)/1000 : 0;
       for (let j = 0; j < B.n; j++){
         const ci = B.idx[j];
         const mm = meta[ci] || ['?','?','U'];
-        let az = B.az[j], el = B.el[j];
+        let az = B.az[j], el = B.el[j], rate = null;
         if (mapA && mapA.has(ci)){
           const k = mapA.get(ci);
           az = lerpAngle(A.az[k], B.az[j], f);
           el = A.el[k] + (B.el[j] - A.el[k]) * f;
+          /* the object's own sky-track speed, for matching against a locked target */
+          if (dtS > 0){
+            const c = Math.sin(A.el[k])*Math.sin(B.el[j]) +
+                      Math.cos(A.el[k])*Math.cos(B.el[j])*Math.cos(A.az[k]-B.az[j]);
+            rate = Math.acos(Math.min(1,Math.max(-1,c))) * 180/Math.PI / dtS;
+          }
         }
         out[j] = { norad: mm[1], name: mm[0], type: mm[2],
-                   az, el, rangeKm: B.rng[j], sunlit: !!(B.flg[j] & 1) };
+                   az, el, rangeKm: B.rng[j], sunlit: !!(B.flg[j] & 1), rateDps: rate };
       }
       return out;
     }
@@ -615,9 +624,11 @@ const on=k=>tog[k].dataset.on==='1';
 /* tabs */
 $('tabSky').addEventListener('click',()=>switchTab('sky'));
 $('tabAn').addEventListener('click',()=>switchTab('an'));
+$('tabLock').addEventListener('click',()=>switchTab('lock'));
 let tab='sky';
 function switchTab(t){tab=t;$('tabSky').setAttribute('aria-selected',t==='sky');
-  $('tabAn').setAttribute('aria-selected',t==='an');renderSheet();}
+  $('tabAn').setAttribute('aria-selected',t==='an');
+  $('tabLock').setAttribute('aria-selected',t==='lock');renderSheet();}
 
 /* ============================ diagnostics ============================ */
 const diag={gps:'—',compass:'—',air:'—',sat:'—',str:STARS.length+' emb'};
@@ -710,7 +721,8 @@ $('start').addEventListener('click',async()=>{
     const s=await navigator.mediaDevices.getUserMedia({
       video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}},audio:false});
     video.srcObject=s;await video.play();running=true;
-    $('start').textContent='Live';$('start').disabled=true;$('capture').disabled=false;
+    $('start').textContent='Live';$('start').disabled=true;
+    $('capture').disabled=false;$('lock').disabled=false;
     setStatus('Live. Full sky overlaid; moving lights flagged. No video is recorded — stills only.','ok');
     startLoop();refreshSky();
   }catch(e){setStatus('Camera blocked: '+e.message+' — needs HTTPS + permission. '+
@@ -831,6 +843,7 @@ $('starUrl').addEventListener('change',async e=>{
 });
 
 /* recompute all known object az/el */
+let prevKnowns=new Map();
 function refreshSky(){
   if(!me)return;
   const now=new Date(),k=[];
@@ -854,6 +867,16 @@ function refreshSky(){
       const el=la.elevation*R2D;if(el>0){satUp++;
         k.push({name:s.name,az:rev(la.azimuth*R2D),el,color:'var(--sat)',kind:'sat',
           meta:`${Math.round(la.rangeSat)}km`});}}catch(e){}});}
+  /* measure each known object's own sky-track rate against the last refresh, so a
+     locked target can be tested on how it moves and not only on where it is */
+  const tNow=now.getTime(),nextPrev=new Map();
+  k.forEach(o=>{
+    const p=prevKnowns.get(o.kind+'|'+o.name);
+    if(p){const dt=(tNow-p.t)/1000;
+      if(dt>0.5&&dt<60)o.rate=angSepDeg(p.az,p.el,o.az,o.el)/dt;}
+    nextPrev.set(o.kind+'|'+o.name,{az:o.az,el:o.el,t:tNow});
+  });
+  prevKnowns=nextPrev;
   knowns=k;
 
   /* fixed sky: stars, DSOs, active meteor radiants */
@@ -998,6 +1021,39 @@ function drawOverlay(){
     });
   }
 
+  /* locked target: the trail is drawn from stored sky positions, so it shows the
+     light's real path across the sky rather than the phone's wander */
+  if(LOCK.on&&LOCK.samples.length){
+    const S=LOCK.samples;
+    octx.strokeStyle='rgba(255,107,107,.45)';octx.lineWidth=1.5;
+    octx.beginPath();let pen=false;
+    for(let i=Math.max(0,S.length-150);i<S.length;i++){
+      const sm=S[i];if(sm.az==null){pen=false;continue;}
+      const p=project(sm.az,sm.el);if(!p){pen=false;continue;}
+      if(pen)octx.lineTo(p.x,p.y);else{octx.moveTo(p.x,p.y);pen=true;}
+    }
+    octx.stroke();
+    const lastS=S[S.length-1];
+    const p=lastS.az!=null?project(lastS.az,lastS.el):null;
+    if(p){
+      octx.strokeStyle='#ff6b6b';octx.lineWidth=2;
+      octx.strokeRect(p.x-16,p.y-16,32,32);
+      octx.beginPath();
+      octx.moveTo(p.x-27,p.y);octx.lineTo(p.x-19,p.y);
+      octx.moveTo(p.x+19,p.y);octx.lineTo(p.x+27,p.y);
+      octx.moveTo(p.x,p.y-27);octx.lineTo(p.x,p.y-19);
+      octx.moveTo(p.x,p.y+19);octx.lineTo(p.x,p.y+27);
+      octx.stroke();
+      const v=LOCK.verdict;
+      if(v){
+        octx.font='10px ui-monospace';
+        octx.fillStyle=v.kind==='match'?'#5fd3bc':v.kind==='none'?'#ff6b6b':'#ffb347';
+        octx.fillText(v.label,p.x+22,p.y-19);
+        if(v.st)octx.fillText(v.st.rate.toFixed(2)+'°/s',p.x+22,p.y-7);
+      }
+    }
+  }
+
   // center reticle
   octx.strokeStyle='rgba(95,211,188,.25)';octx.lineWidth=1;
   octx.beginPath();octx.moveTo(overlay.width/2-14,overlay.height/2);octx.lineTo(overlay.width/2+14,overlay.height/2);
@@ -1009,19 +1065,259 @@ function drawOverlay(){
     octx.font='10px ui-monospace';octx.fillText(o.name,p.x+11,p.y+3);});
 }
 
+
+/* ============================ lock on a light, then identify it ============================
+ The track is kept in SKY coordinates, not screen pixels: each detection is
+ unprojected through the live camera basis before it is stored. A handheld phone
+ swings several degrees a second, which would swamp the target's real motion if
+ the track lived in pixels. In the sky frame the phone's movement cancels and what
+ is left is how the light actually moves against the stars — the one measurement
+ that separates a satellite from an aircraft from a star.
+ Identification then gates on angular separation and corroborates with that rate.
+============================================================================== */
+const SIDEREAL=0.00417;          // deg/s — the sky's own drift
+const LOCK_GATE=8;               // deg; phone magnetometers are routinely 5-15 deg out
+let lastGray=null,lastMotion=null;
+const LOCK={on:false,samples:[],rad:14,started:0,verdict:null,lastCalc:0,
+            lastSeen:0,seed:{x:0,y:0}};
+
+function angSepDeg(az1,el1,az2,el2){
+  const a1=az1*D2R,e1=el1*D2R,a2=az2*D2R,e2=el2*D2R;
+  const c=Math.sin(e1)*Math.sin(e2)+Math.cos(e1)*Math.cos(e2)*Math.cos(a1-a2);
+  return Math.acos(Math.min(1,Math.max(-1,c)))*R2D;
+}
+/* brightest point in a window, refined to a brightness-weighted centroid */
+function findBlob(gray,cx,cy,rad){
+  const x0=Math.max(0,Math.round(cx-rad)),x1=Math.min(GW-1,Math.round(cx+rad));
+  const y0=Math.max(0,Math.round(cy-rad)),y1=Math.min(GH-1,Math.round(cy+rad));
+  if(x1<=x0||y1<=y0)return null;
+  let best=-1,bx=cx,by=cy,sum=0,n=0;
+  for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++){
+    const v=gray[y*GW+x];sum+=v;n++;if(v>best){best=v;bx=x;by=y;}}
+  const bg=sum/n;
+  if(best-bg<6)return null;                       // nothing stands out from the sky
+  let sw=0,sx=0,sy=0;
+  for(let y=Math.max(0,by-2);y<=Math.min(GH-1,by+2);y++)
+    for(let x=Math.max(0,bx-2);x<=Math.min(GW-1,bx+2);x++){
+      const w=Math.max(0,gray[y*GW+x]-bg);sw+=w;sx+=w*x;sy+=w*y;}
+  if(sw<=0)return null;
+  return{x:sx/sw,y:sy/sw,peak:best,bg};
+}
+function dropLock(why){
+  LOCK.on=false;LOCK.samples=[];LOCK.verdict=null;
+  $('lock').textContent='Lock';$('lock').classList.remove('primary');
+  if(why)setStatus('Lock dropped — '+why+'.','');
+  renderSheet();
+}
+function startLock(sx,sy){
+  if(!running){setStatus('Start the camera before locking onto a light.','err');return;}
+  if(!basis){setStatus('Turn the compass on first — a lock has to be placed on the sky, not the screen.','err');return;}
+  if(!lastGray){setStatus('No camera frame yet — give it a moment.','err');return;}
+  const q=screenToProc(sx,sy);
+  const bl=findBlob(lastGray,q.x,q.y,24);
+  /* Arm even with nothing visible right now: an aircraft beacon is dark most of the
+     time, and demanding a light at the instant of the tap would refuse exactly the
+     targets worth locking. The tracker gets a few seconds to acquire. */
+  LOCK.on=true;LOCK.samples=[];LOCK.started=Date.now();LOCK.lastSeen=Date.now();
+  LOCK.seed=bl?{fx:bl.x/GW,fy:bl.y/GH}:{fx:q.x/GW,fy:q.y/GH};
+  LOCK.verdict=null;LOCK.lastCalc=0;
+  $('lock').textContent='Drop';$('lock').classList.add('primary');
+  switchTab('lock');
+  setStatus(bl?'Locked. Keep the light near the reticle for a few seconds while the track builds.'
+              :'Armed on that spot — waiting for a light to appear there (a beacon may be mid-blink).','ok');
+}
+/* one detection per frame, stored in sky coordinates */
+function trackLock(gray,rgb){
+  lastGray=gray;
+  if(!LOCK.on)return;
+  const S=LOCK.samples,last=S.length?S[S.length-1]:null;
+  const now=Date.now();
+  let px,py,predAz=null,predEl=null;
+  if(last&&last.az!=null&&basis){
+    const p=project(last.az,last.el);          // re-aim through the current attitude
+    if(!p){if(now-LOCK.lastSeen>4000)dropLock('the target left the frame');return;}
+    const q=screenToProc(p.x,p.y);px=q.x;py=q.y;predAz=last.az;predEl=last.el;
+  }else if(last){px=last.sx;py=last.sy;}
+  else{px=LOCK.seed.fx*GW;py=LOCK.seed.fy*GH;}
+  const bl=findBlob(gray,px,py,S.length?LOCK.rad:24);
+  if(!bl){
+    if(now-LOCK.lastSeen>4000){dropLock('lost the light for four seconds');return;}
+    /* Between flashes the target is still the target. Record the gap as a dark
+       sample: photometry needs the off phase to see a beacon at all, and the
+       position fit ignores these so a held position cannot fake a slower track. */
+    if(last){S.push({t:now,az:predAz,el:predEl,sx:px,sy:py,peak:0,bg:0,r:0,g:0,b:0,dark:true});
+      if(S.length>300)S.shift();}
+    return;
+  }
+  LOCK.lastSeen=now;
+  const sc=procToScreen(bl.x,bl.y);
+  const q=basis?unproject(sc.x,sc.y):null;
+  const i=(Math.min(GH-1,Math.max(0,Math.round(bl.y)))*GW+
+           Math.min(GW-1,Math.max(0,Math.round(bl.x))))*4;
+  S.push({t:Date.now(),az:q?q.az:null,el:q?q.el:null,sx:bl.x,sy:bl.y,
+          peak:bl.peak,bg:bl.bg,r:rgb[i],g:rgb[i+1],b:rgb[i+2]});
+  if(S.length>300)S.shift();
+  if(now-LOCK.lastCalc>500){LOCK.lastCalc=now;LOCK.verdict=assess();}
+}
+/* least-squares sky-track velocity over the recent window */
+function trackStats(){
+  const S=LOCK.samples.filter(s=>s.az!=null&&!s.dark);
+  if(S.length<6)return null;
+  const span=(S[S.length-1].t-S[0].t)/1000;
+  if(span<0.6)return null;
+  const mEl=S.reduce((a,s)=>a+s.el,0)/S.length, ce=Math.cos(mEl*D2R);
+  const t0=S[0].t,a0=S[0].az,e0=S[0].el;
+  const pts=S.map(s=>({t:(s.t-t0)/1000, x:shortAngle(s.az-a0)*ce, y:s.el-e0}));
+  const slope=k=>{let st=0,sv=0,stt=0,stv=0;const n=pts.length;
+    pts.forEach(p=>{st+=p.t;sv+=p[k];stt+=p.t*p.t;stv+=p.t*p[k];});
+    const d=n*stt-st*st;return d===0?0:(n*stv-st*sv)/d;};
+  const vx=slope('x'),vy=slope('y');
+  /* scatter about the fit — how much of the motion is jitter rather than travel */
+  let ss=0;pts.forEach(p=>{const dx=p.x-vx*p.t,dy=p.y-vy*p.t;ss+=dx*dx+dy*dy;});
+  return{rate:Math.hypot(vx,vy),bearing:rev(Math.atan2(vx,vy)*R2D),
+         span,n:S.length,scatter:Math.sqrt(ss/pts.length)};
+}
+function photometry(){
+  const S=LOCK.samples;
+  if(S.length<8)return null;
+  const v=S.map(s=>Math.max(0,s.peak-s.bg));
+  const m=v.reduce((a,b)=>a+b,0)/v.length;
+  const sd=Math.sqrt(v.reduce((a,b)=>a+(b-m)*(b-m),0)/v.length);
+  const span=(S[S.length-1].t-S[0].t)/1000;
+  /* Only call it a strobe if it behaves like one. A beacon goes bright-to-dark, so
+     demand deep modulation; and refuse to report above ~5 Hz, where a handheld frame
+     rate is aliasing rather than resolving. Sub-pixel jitter on a moving point
+     otherwise reads as a fast flash that is not there. */
+  let cross=0;
+  const mx=Math.max.apply(null,v),mn=Math.min.apply(null,v);
+  if(mx>0&&mn<0.45*mx&&m>0&&sd/m>0.30){
+    let state=0;const hi=m+sd*0.5,lo=m-sd*0.5;
+    v.forEach(x=>{if(state<=0&&x>hi){state=1;cross++;}else if(state>=0&&x<lo)state=-1;});
+    if(span>0&&cross/span>5)cross=0;              // above Nyquist for a phone camera
+  }
+  const litAll=S.filter(s=>!s.dark),tail=litAll.slice(-30),n=tail.length||1;
+  return{mean:m,cv:m>0?sd/m:0,flashHz:span>0?cross/span:0,
+    duty:S.length?litAll.length/S.length:1,
+    r:Math.round(tail.reduce((a,s)=>a+s.r,0)/n),
+    g:Math.round(tail.reduce((a,s)=>a+s.g,0)/n),
+    b:Math.round(tail.reduce((a,s)=>a+s.b,0)/n)};
+}
+/* everything the app currently believes is up there, with its own sky-track rate */
+function candidates(){
+  const out=[];
+  knowns.forEach(o=>out.push({name:o.name,kind:o.kind,az:o.az,el:o.el,meta:o.meta||'',
+    rate:o.rate!=null?o.rate:(o.kind==='star'?SIDEREAL:
+      (o.kind==='sun'||o.kind==='moon'||o.kind==='planet')?SIDEREAL:null)}));
+  if(engineReady)engineVisible().forEach(o=>{
+    if(o.el<=0)return;
+    if(o.type!=='P'&&!on('debris'))return;
+    out.push({name:o.name,kind:'sat',az:rev(o.az*R2D),el:o.el*R2D,rate:o.rateDps,
+      meta:Math.round(o.rangeKm)+'km '+(o.sunlit?'sunlit':'in shadow')});});
+  const lim=+$('smag').value+1;
+  starsUp.forEach(s=>{if(s.el>0&&s.mag<=lim)
+    out.push({name:s.name,kind:'star',az:s.az,el:s.el,rate:SIDEREAL,meta:'m'+s.mag.toFixed(1)});});
+  dsoUp.forEach(o=>out.push({name:o.name,kind:'dso',az:o.az,el:o.el,rate:SIDEREAL,
+    meta:'m'+o.mag.toFixed(1)}));
+  return out;
+}
+function rateAgrees(obs,cand){
+  if(cand==null)return null;                       // no rate known for this candidate
+  if(Math.abs(obs-cand)<0.03)return true;          // both effectively still
+  const hi=Math.max(obs,cand),lo=Math.min(obs,cand);
+  return lo>0?(hi/lo)<=2.5:false;
+}
+function behaviour(st,ph){
+  const r=st.rate;let s;
+  if(r<0.02)      s='holding still against the stars — a star, planet, or a fixed distant light';
+  else if(r<0.15) s='drifting slowly — a high aircraft, a satellite low on the horizon, or a balloon';
+  else if(r<2)    s='a steady sky track — the range an orbiting satellite or an aircraft at distance makes';
+  else if(r<10)   s='moving fast — a close aircraft, a drone, or a bird catching light';
+  else            s='very fast — a meteor, a bird, or an insect near the lens';
+  if(ph&&ph.flashHz>0.4)
+    s+='; strobing near '+ph.flashHz.toFixed(1)+' Hz, which is how aircraft anti-collision beacons read';
+  else if(ph&&ph.cv>0.45)
+    s+='; brightness swinging widely — tumbling, flaring, or scintillation low in the sky';
+  return s;
+}
+function assess(){
+  const st=trackStats(),ph=photometry();
+  const S=LOCK.samples.filter(s=>s.az!=null&&!s.dark);
+  const last=S.length?S[S.length-1]:null;
+  if(!last)return{label:'no sky fix',st,ph,list:[]};
+  if(!st)return{label:'measuring…',st,ph,list:[],pos:last};
+  const list=candidates()
+    .map(c=>({...c,sep:angSepDeg(last.az,last.el,c.az,c.el)}))
+    .filter(c=>c.sep<=LOCK_GATE*2)
+    .sort((a,b)=>a.sep-b.sep).slice(0,6);
+  /* A regular 0.5-3 Hz beacon that goes fully dark is aircraft behaviour. Nothing in
+     orbit and nothing in the star catalogue does it, so a strobe rules those out even
+     when the position and rate would otherwise fit. */
+  const strobing=!!(ph&&ph.flashHz>=0.5&&ph.flashHz<=3&&ph.duty<0.8);
+  const NOT_STROBERS={sat:1,star:1,dso:1,planet:1,moon:1,sun:1};
+  list.forEach(c=>{
+    c.rateOk=rateAgrees(st.rate,c.rate);
+    c.vetoed=strobing&&!!NOT_STROBERS[c.kind];
+  });
+  const inGate=list.filter(c=>c.sep<=LOCK_GATE);
+  const agree=inGate.filter(c=>c.rateOk===true&&!c.vetoed);
+  let label,best=null,kind;
+  if(agree.length){best=agree[0];label=best.name;kind='match';}
+  else if(strobing){label='UNIDENTIFIED';kind='none';}   // beacon, but nothing in the feed fits
+  else if(inGate.length){best=inGate[0];label='motion disagrees';kind='conflict';}
+  else{label='UNIDENTIFIED';kind='none';}
+  return{label,kind,best,list,st,ph,pos:last,strobing,note:behaviour(st,ph)};
+}
+
+overlay.addEventListener('pointerdown',e=>{
+  if(!running)return;
+  const r=overlay.getBoundingClientRect();
+  startLock(e.clientX-r.left,e.clientY-r.top);
+});
+$('lock').addEventListener('click',()=>{
+  if(LOCK.on){dropLock('you dropped it');return;}
+  /* no tap target: fall back to whatever the motion detector last flagged */
+  const m=lastMotion&&Date.now()-lastMotion.t<3000
+    ? lastMotion : {x:overlay.width/2,y:overlay.height/2};
+  startLock(m.x,m.y);
+});
+
 /* ============================ render + detection loop ============================ */
 /* The overlay runs on its own: the sky map still works when the camera is
    unavailable or denied, and only the motion detector needs a live video frame. */
-const GW=proc.width,GH=proc.height,NPX=GW*GH;
+/* The detector canvas is sized to the display's aspect and filled with exactly the
+   region object-fit:cover shows, so proc pixels and screen pixels differ by one
+   uniform scale. Without that, a tapped light and its image blob are not the same
+   place: the old code squashed the whole frame into 256x192 but mapped it back as
+   though it had been cover-cropped. */
+let GW=1,GH=1,NPX=1;
+function sizeProc(){
+  const W=overlay.width,H=overlay.height,L=192;
+  const w=W>=H?L:Math.max(1,Math.round(L*W/H));
+  const h=W>=H?Math.max(1,Math.round(L*H/W)):L;
+  if(w!==GW||h!==GH){proc.width=GW=w;proc.height=GH=h;NPX=GW*GH;prev=null;}
+}
+function grabFrame(){                       // cover-crop the video into proc
+  const vw=video.videoWidth,vh=video.videoHeight;
+  if(!vw||!vh)return false;
+  const s=Math.max(overlay.width/vw,overlay.height/vh);
+  const cw=overlay.width/s,ch=overlay.height/s;
+  pctx.drawImage(video,(vw-cw)/2,(vh-ch)/2,cw,ch,0,0,GW,GH);
+  return true;
+}
+const procToScreen=(x,y)=>({x:x/GW*overlay.width, y:y/GH*overlay.height});
+const screenToProc=(x,y)=>({x:x/overlay.width*GW, y:y/overlay.height*GH});
 let rafOn=false;
 function startLoop(){if(!rafOn){rafOn=true;requestAnimationFrame(loop);}}
 function loop(){
-  let gray=null;
+  let gray=null,rgb=null;
   if(running){
-    pctx.drawImage(video,0,0,GW,GH);
-    const cur=pctx.getImageData(0,0,GW,GH).data;gray=new Float32Array(NPX);
-    for(let i=0,p=0;i<NPX;i++,p+=4)gray[i]=cur[p]*0.299+cur[p+1]*0.587+cur[p+2]*0.114;
+    sizeProc();
+    if(grabFrame()){
+      rgb=pctx.getImageData(0,0,GW,GH).data;gray=new Float32Array(NPX);
+      for(let i=0,p=0;i<NPX;i++,p+=4)gray[i]=rgb[p]*0.299+rgb[p+1]*0.587+rgb[p+2]*0.114;
+    }
   }
+  if(gray)trackLock(gray,rgb);
   drawOverlay();
   if(gray&&prev){
     const thr=+$('sens').value;let changed=0,best=-1,bx=0,by=0;
@@ -1029,10 +1325,10 @@ function loop(){
       if(d>thr&&gray[i]>70){changed++;if(d>best){best=d;bx=x;by=y;}}}
     if(cooldown>0)cooldown--;
     if(best>0&&changed/NPX<0.03){
-      const s=Math.max(overlay.width/GW,overlay.height/GH);
-      const ox=(overlay.width-GW*s)/2,oy=(overlay.height-GH*s)/2,px=ox+bx*s,py=oy+by*s;
+      const q=procToScreen(bx,by);
       octx.strokeStyle=changed/NPX<0.006?'#ff6b6b':'#ffb347';octx.lineWidth=2;
-      octx.beginPath();octx.arc(px,py,17,0,7);octx.stroke();
+      octx.beginPath();octx.arc(q.x,q.y,17,0,7);octx.stroke();
+      lastMotion={x:q.x,y:q.y,t:Date.now()};
       if(cooldown===0){hitCount++;$('hHit').textContent=hitCount;cooldown=25;}
     }
   }
@@ -1141,6 +1437,8 @@ function renderSheet(){
       `<span class="v">${r.up?`az ${Math.round(r.az)}° · el ${Math.round(r.el)}°`:'below horizon'} · pk ${r.peak} · ZHR ${r.zhr}</span></div>`).join('');
     else html+=`<div class="hint" style="padding:.25rem 0">no major meteor shower active</div>`;
     b.innerHTML=html;
+  } else if(tab==='lock'){
+    b.innerHTML=lockPanel();
   } else {
     if(!analysis){b.innerHTML='<div class="hint">Take a screenshot to extract point sources, their az/el, colour, and known-object matches (aircraft, sats, planets, stars, deep sky).</div>';return;}
     const head=`<div class="hint">${analysis.when} · GPS ${analysis.gps} · aim ${analysis.aim} · sky glow ${analysis.mean} · moon ${analysis.moon} · ${analysis.count} point sources</div>`;
@@ -1152,6 +1450,69 @@ function renderSheet(){
         `<span class="v">${azel} · L${Math.round(p.L)}</span></div>`;}).join('');
     b.innerHTML=head+rows;
   }
+}
+
+function lockPanel(){
+  if(!LOCK.on)
+    return '<div class="hint">Tap a light in the view to lock onto it, or press Lock to grab the '+
+      'last flagged motion. The track is measured against the stars, so its speed across the sky '+
+      'is real even though the phone is moving. Needs the camera and the compass on.</div>';
+  const v=LOCK.verdict;
+  if(!v||!v.st)
+    return '<div class="hint">Tracking — hold the light near the reticle. '+
+      LOCK.samples.length+' samples so far; a verdict needs about a second of steady track.</div>';
+  const st=v.st,ph=v.ph,pos=v.pos;
+  const head=v.kind==='match'?'var(--lock)':v.kind==='none'?'var(--hit)':'var(--planet)';
+  const title=v.kind==='match'?'MATCH · '+v.best.name
+            :v.kind==='conflict'?'NEAREST OBJECT DISAGREES'
+            :'NO CATALOGUE MATCH';
+  let h='<div class="obj"><span class="nm" style="color:'+head+'"><b>'+title+'</b></span>'+
+        '<span class="v">'+st.rate.toFixed(3)+'°/s · '+Math.round(st.bearing)+'° pa</span></div>';
+  h+='<div class="hint" style="padding:.2rem 0">'+v.note+'</div>';
+  h+='<div class="obj"><span class="nm">position</span><span class="v">az '+
+     Math.round(pos.az)+'° · el '+Math.round(pos.el)+'°</span></div>';
+  h+='<div class="obj"><span class="nm">track</span><span class="v">'+st.n+' samples · '+
+     st.span.toFixed(1)+'s · scatter '+st.scatter.toFixed(2)+'°</span></div>';
+  if(ph)h+='<div class="obj"><span class="nm"><span class="dot" style="background:rgb('+
+     ph.r+','+ph.g+','+ph.b+')"></span>light</span><span class="v">'+
+     Math.round(ph.mean)+' over sky · var '+(ph.cv*100).toFixed(0)+'%'+
+     (ph.flashHz>0.4?' · '+ph.flashHz.toFixed(1)+' Hz':'')+'</span></div>';
+
+  h+='<div class="hint" style="padding:.35rem 0 .1rem">nearest catalogued objects</div>';
+  if(!v.list.length)
+    h+='<div class="obj"><span class="nm">nothing within '+(LOCK_GATE*2)+'°</span>'+
+       '<span class="v">—</span></div>';
+  v.list.forEach(c=>{
+    const mark=c.vetoed?'✗ does not strobe':
+      c.rateOk===true?'✓ motion fits':c.rateOk===false?'✗ motion differs':'· rate unknown';
+    const col=c.vetoed?'var(--hit)':
+      c.rateOk===true?'var(--lock)':c.rateOk===false?'var(--hit)':'var(--dim)';
+    h+='<div class="obj"><span class="nm">'+c.name+
+       ' <span style="color:var(--dim)">'+c.kind+(c.meta?' '+c.meta:'')+'</span></span>'+
+       '<span class="v">'+c.sep.toFixed(1)+'° off · <span style="color:'+col+'">'+mark+'</span>'+
+       (c.rate!=null?' · '+c.rate.toFixed(3)+'°/s':'')+'</span></div>';
+  });
+
+  /* What "unidentified" is actually allowed to mean here. */
+  const caveats=[];
+  caveats.push('compass error moves everything together — a few degrees is normal, so separation alone never settles it');
+  if(diag.compass==='rel')caveats.push('this compass has no true north; azimuths are offset by whatever the trim slider is set to');
+  if(diag.air!=='ok'&&!/rx/.test(diag.air))caveats.push('no live aircraft feed, so planes are not in the comparison at all');
+  else caveats.push('ADS-B only sees aircraft that transmit it — military and some light aircraft do not');
+  caveats.push('the satellite catalogue excludes classified objects and is '+
+    (SATENGINE.stats().generated?stats_gen().replace(' · TLEs ','').replace(' old','')+' old':'of unknown age'));
+  h+='<div class="hint" style="padding:.35rem 0 0;color:var(--dim)">'+
+     (v.kind==='none'&&v.strobing
+       ? 'It strobes like an aircraft beacon, which rules out the satellites and stars nearby whatever '+
+         'their position says. No aircraft in the feed fits — usual causes are an aircraft not '+
+         'transmitting ADS-B, or no feed at all — '
+       : v.kind==='none'
+       ? 'No catalogued object sits within '+LOCK_GATE+'° with matching motion. That means unmatched against what this app can see, which is not the same as unexplained — '
+       : v.kind==='conflict'
+       ? 'The nearest object is close in the sky but moves differently, so the identification is not supported — '
+       : 'Matched on both position and motion — ')+
+     'bear in mind: '+caveats.join('; ')+'.</div>';
+  return h;
 }
 function stats_gen(){
   const g=SATENGINE.stats().generated;
