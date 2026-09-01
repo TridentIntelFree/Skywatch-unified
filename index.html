@@ -79,7 +79,7 @@
 <div id="hud">
   <div>BRG <b id="hBrg">—</b></div>
   <div>ELV <b id="hElv">—</b></div>
-  <div>FOV <b id="hFov">63°</b></div>
+  <div>FOV <b id="hFov">68°</b></div>
   <div>GPS <b id="hGps">—</b></div>
   <div>AIR <b id="hAir">0</b> · SAT <b id="hSat">0</b></div>
   <div>STR <b id="hStr">0</b> · HITS <b id="hHit">0</b></div>
@@ -106,8 +106,8 @@
 
   <div class="sliders">
     <div class="slide"><label>Sensitivity</label><input type="range" id="sens" min="6" max="60" value="26"><output id="oSens">26</output></div>
-    <div class="slide"><label>Field of view</label><input type="range" id="fov" min="40" max="90" value="63"><output id="oFov">63°</output></div>
-    <div class="slide"><label>Heading trim</label><input type="range" id="trim" min="-40" max="40" value="0"><output id="oTrim">0°</output></div>
+    <div class="slide"><label>Camera FOV</label><input type="range" id="fov" min="25" max="120" value="68"><output id="oFov">68°</output></div>
+    <div class="slide"><label>Heading trim</label><input type="range" id="trim" min="-180" max="180" value="0"><output id="oTrim">0°</output></div>
     <div class="slide"><label>Star mag ≤</label><input type="range" id="smag" min="1.5" max="6.5" step="0.5" value="4.0"><output id="oSmag">4.0</output></div>
     <div class="slide"><label>Sat TLE URL</label><input type="text" id="tleUrl" value="https://celestrak.org/NORAD/elements/gp.php?GROUP=visual&FORMAT=tle"></div>
     <div class="slide"><label>Star DB URL</label><input type="text" id="starUrl" placeholder="optional: hosted catalog JSON [[name,ra°,dec°,mag],…] or CSV"></div>
@@ -577,7 +577,9 @@ function showerActive(s,date){
 const $=id=>document.getElementById(id);
 const video=$('cam'),overlay=$('overlay'),proc=$('proc'),
       octx=overlay.getContext('2d'),pctx=proc.getContext('2d',{willReadFrequently:true});
-let me=null, heading=null, elevation=null, roll=0, running=false;
+let me=null, heading=null, elevation=null, running=false;
+let basis=null;              // {f,r,u}: camera forward, screen right, screen up — earth [E,N,U]
+let FOV={tx:0.67,ty:1.45};   // tan(half-FOV) per screen axis, refreshed each frame
 let prev=null, hitCount=0, cooldown=0;
 let aircraft=[], satrecs=[], knowns=[];   // knowns: {name,az,el,color,kind}
 let starsUp=[], dsoUp=[], radUp=[];       // fixed-sky layers, refreshed with knowns
@@ -592,7 +594,8 @@ function engineVisible(){
   return engCache.objs;
 }
 
-function setStatus(t,c){const s=$('status');s.textContent=t;s.className=c||'';}
+function setStatus(t,c){const s=$('status');s.textContent=t;s.className=c||'';s.dataset.kind=c||'';}
+const statusIsError=()=>$('status').dataset.kind==='err';
 function fit(){overlay.width=innerWidth;overlay.height=innerHeight;}
 addEventListener('resize',fit);fit();
 
@@ -626,31 +629,79 @@ function renderDiag(){
 renderDiag();
 
 /* ============================ geolocation (tap-triggered) ============================ */
+let geoWatch=null, geoNudge=null, skyTimer=null, airTimer=null;
+/* Sky refresh is tied to having an observer, not to the camera, so the map keeps
+   updating whether or not the camera ever starts. Aircraft are polled far less
+   often than the sky — the public ADS-B endpoints ask for a light touch. */
+function startTimers(){
+  if(!skyTimer)skyTimer=setInterval(refreshSky,4000);
+  if(!airTimer)airTimer=setInterval(loadAircraft,15000);
+}
+function setLocation(lat,lon,alt,how){
+  me={lat,lon,alt};
+  diag.gps=how;$('hGps').textContent=lat.toFixed(3)+','+lon.toFixed(3);
+  renderDiag();
+  SATENGINE.setObserver(lat,lon,alt);
+  loadAircraft();refreshSky();startTimers();startLoop();
+}
 function applyPos(p){
-  me={lat:p.coords.latitude,lon:p.coords.longitude,alt:p.coords.altitude||300};
-  diag.gps='ok';$('hGps').textContent=me.lat.toFixed(3)+','+me.lon.toFixed(3);
-  $('geo').textContent='Located';renderDiag();refreshSky();
-  SATENGINE.setObserver(me.lat,me.lon,me.alt);
+  if(geoNudge){clearTimeout(geoNudge);geoNudge=null;}
+  const acc=p.coords.accuracy;
+  setLocation(p.coords.latitude,p.coords.longitude,
+              isFinite(p.coords.altitude)?p.coords.altitude:300,'ok');
+  $('geo').textContent='Located';
+  setStatus(`Location fixed to ±${Math.round(acc||0)} m — sky, satellites and aircraft now computed from here.`,'ok');
+}
+function geoFail(e){
+  if(geoNudge){clearTimeout(geoNudge);geoNudge=null;}
+  const code=e&&e.code;
+  diag.gps=code===1?'denied':code===3?'timeout':'unavail';renderDiag();
+  if(code===1){
+    setStatus('Location permission denied. On iPhone: Settings → Privacy & Security → Location Services → '+
+      'make sure it is On and Safari Websites is "While Using", then reload and tap Location again. '+
+      'Otherwise type lat,lon in the manual field.','err');
+  }else if(code===3){
+    setStatus('No position fix yet — GPS can be slow indoors. Move near a window or outside and tap Location '+
+      'again, or type lat,lon in the manual field.','err');
+  }else{
+    setStatus('Location unavailable'+(e&&e.message?' ('+e.message+')':'')+
+      '. Type lat,lon in the manual field to carry on.','err');
+  }
 }
 $('geo').addEventListener('click',()=>{
   if(!navigator.geolocation){diag.gps='no api';renderDiag();
-    setStatus('No geolocation API. Type coordinates in the manual field.','err');return;}
-  setStatus('Requesting location — accept the prompt…');
-  navigator.geolocation.getCurrentPosition(applyPos,e=>{
-    diag.gps='denied';renderDiag();
-    setStatus('Location blocked: '+e.message+'. If no prompt appeared you\'re likely in an app preview — '+
-      'deploy to Pages and open the https URL in Safari, or type lat,lon in the manual field.','err');
-  },{enableHighAccuracy:true,timeout:12000,maximumAge:10000});
-  try{navigator.geolocation.watchPosition(applyPos,()=>{},{enableHighAccuracy:true,maximumAge:15000});}catch(e){}
+    setStatus('No geolocation API in this browser. Type coordinates in the manual field.','err');return;}
+  if(!window.isSecureContext){diag.gps='insecure';renderDiag();
+    setStatus('Location needs a secure page. Open the https:// address in the browser — a file:// or plain '+
+      'http:// copy can never get a fix. Manual lat,lon works anywhere.','err');return;}
+  if(window.self!==window.top){
+    setStatus('This page is inside a frame, where iOS refuses location. Open it directly in Safari, '+
+      'or type lat,lon in the manual field.','err');
+  }
+  setStatus('Requesting location — accept the prompt. The first fix can take a few seconds.');
+  /* No timeout on the first call: the permission prompt itself can outlast any timer,
+     and a timer that expires while the prompt is still up reports a failure for a
+     request the user is about to allow. Coarse accuracy answers fastest; the watch
+     below then refines it. */
+  navigator.geolocation.getCurrentPosition(applyPos,geoFail,
+    {enableHighAccuracy:false,maximumAge:60000});
+  if(geoWatch===null){        // one watch only, however many times Location is tapped
+    try{geoWatch=navigator.geolocation.watchPosition(applyPos,()=>{},
+      {enableHighAccuracy:true,maximumAge:15000});}catch(e){}
+  }
+  if(geoNudge)clearTimeout(geoNudge);
+  geoNudge=setTimeout(()=>{
+    if(!me)setStatus('Still waiting on a fix. If no permission prompt appeared, this page may be in an '+
+      'in-app browser or a preview — open the https address in Safari itself. Manual lat,lon always works.','err');
+  },20000);
 });
 $('manual').addEventListener('change',e=>{
   const m=e.target.value.split(',').map(s=>parseFloat(s.trim()));
-  if(m.length===2&&isFinite(m[0])&&isFinite(m[1])){
-    me={lat:m[0],lon:m[1],alt:300};diag.gps='manual';
-    $('hGps').textContent=me.lat.toFixed(3)+','+me.lon.toFixed(3);renderDiag();refreshSky();
-    SATENGINE.setObserver(me.lat,me.lon,me.alt);
-    setStatus('Manual location set — aircraft and sky now computed from it.','ok');
-  } else setStatus('Format: lat,lon  (e.g. 36.90,-82.00)','err');
+  if(m.length===2&&isFinite(m[0])&&isFinite(m[1])&&Math.abs(m[0])<=90&&Math.abs(m[1])<=180){
+    if(geoNudge){clearTimeout(geoNudge);geoNudge=null;}
+    setLocation(m[0],m[1],300,'manual');
+    setStatus('Manual location set — sky, satellites and aircraft now computed from it.','ok');
+  } else setStatus('Format: lat,lon — latitude −90..90, longitude −180..180 (e.g. 36.90,-82.00)','err');
 });
 
 /* ============================ camera ============================ */
@@ -661,11 +712,40 @@ $('start').addEventListener('click',async()=>{
     video.srcObject=s;await video.play();running=true;
     $('start').textContent='Live';$('start').disabled=true;$('capture').disabled=false;
     setStatus('Live. Full sky overlaid; moving lights flagged. No video is recorded — stills only.','ok');
-    requestAnimationFrame(loop);setInterval(refreshSky,4000);refreshSky();
-  }catch(e){setStatus('Camera blocked: '+e.message+' — needs HTTPS + permission.','err');}
+    startLoop();refreshSky();
+  }catch(e){setStatus('Camera blocked: '+e.message+' — needs HTTPS + permission. '+
+    'The sky overlay still runs without it.','err');}
 });
 
 /* ============================ orientation ============================ */
+/* Full three-axis attitude. The camera's pointing direction and the screen's own
+   right/up axes both come out of the device rotation matrix, so aim stays correct
+   at the zenith and in landscape — the two cases where a beta-only tilt model
+   collapses (near the zenith it loses the azimuth entirely). */
+let absOK=false;
+function screenAngle(){
+  const a=(screen.orientation&&typeof screen.orientation.angle==='number')
+    ? screen.orientation.angle : window.orientation;
+  return typeof a==='number'?a:0;
+}
+/* rotate an earth-frame [E,N,U] vector by d degrees of azimuth */
+function rotAz(v,d){const s=Math.sin(d*D2R),c=Math.cos(d*D2R);
+  return [v[0]*c+v[1]*s, v[1]*c-v[0]*s, v[2]];}
+function setBasis(alphaDeg,betaDeg,gammaDeg,orientDeg,trimDeg){
+  const a=alphaDeg*D2R,b=betaDeg*D2R,g=gammaDeg*D2R;
+  const ca=Math.cos(a),sa=Math.sin(a),cb=Math.cos(b),sb=Math.sin(b),cg=Math.cos(g),sg=Math.sin(g);
+  /* columns of R = Rz(alpha)·Rx(beta)·Ry(gamma): device x/y/z expressed as earth [E,N,U] */
+  const dx=[ca*cg-sa*sb*sg, sa*cg+ca*sb*sg, -cb*sg];
+  const dy=[-sa*cb,         ca*cb,           sb   ];
+  const dz=[ca*sg+sa*sb*cg, sa*sg-ca*sb*cg,  cb*cg];
+  const t=orientDeg*D2R,ct=Math.cos(t),st=Math.sin(t);
+  const f=[-dz[0],-dz[1],-dz[2]];                                    // rear camera looks along -z
+  const r=[ct*dx[0]-st*dy[0], ct*dx[1]-st*dy[1], ct*dx[2]-st*dy[2]]; // screen right
+  const u=[st*dx[0]+ct*dy[0], st*dx[1]+ct*dy[1], st*dx[2]+ct*dy[2]]; // screen up
+  basis={f:rotAz(f,trimDeg),r:rotAz(r,trimDeg),u:rotAz(u,trimDeg)};
+  heading=rev(Math.atan2(basis.f[0],basis.f[1])*R2D);
+  elevation=Math.asin(Math.max(-1,Math.min(1,basis.f[2])))*R2D;
+}
 $('sensors').addEventListener('click',async()=>{
   try{
     if(typeof DeviceOrientationEvent!=='undefined'&&DeviceOrientationEvent.requestPermission){
@@ -673,17 +753,28 @@ $('sensors').addEventListener('click',async()=>{
       if(p!=='granted'){setStatus('Motion denied — overlay needs compass to aim.','err');return;}
     }
     addEventListener('deviceorientation',onOrient);
+    if('ondeviceorientationabsolute' in window)addEventListener('deviceorientationabsolute',onOrient);
     $('sensors').textContent='Compass on';$('sensors').disabled=true;
+    startLoop();
   }catch(e){setStatus('Compass unavailable here.','err');}
 });
 function onOrient(ev){
-  if(typeof ev.webkitCompassHeading==='number')heading=ev.webkitCompassHeading;
-  else if(typeof ev.alpha==='number')heading=rev(360-ev.alpha);
-  if(typeof ev.beta==='number')elevation=Math.max(-90,Math.min(90,ev.beta-90));
-  if(typeof ev.gamma==='number')roll=ev.gamma;
-  if(diag.compass!=='ok'){diag.compass='ok';renderDiag();}
-  $('hBrg').textContent=heading==null?'—':Math.round(heading).toString().padStart(3,'0')+'°';
-  $('hElv').textContent=elevation==null?'—':Math.round(elevation)+'°';
+  const hc=typeof ev.webkitCompassHeading==='number'&&isFinite(ev.webkitCompassHeading)
+           &&ev.webkitCompassHeading>=0;
+  const abs=ev.type==='deviceorientationabsolute'||ev.absolute===true||hc;
+  if(abs)absOK=true; else if(absOK)return;      // once true-north readings arrive, ignore relative ones
+  if(typeof ev.beta!=='number'||typeof ev.gamma!=='number')return;
+  /* iOS reports true north only through webkitCompassHeading; feeding it back in as
+     alpha makes the matrix north-referenced. A relative alpha still gives correct
+     elevation and roll — the azimuth is then off by a constant the trim slider absorbs. */
+  const alpha=hc?rev(360-ev.webkitCompassHeading):(typeof ev.alpha==='number'?ev.alpha:null);
+  if(alpha==null)return;
+  setBasis(alpha,ev.beta,ev.gamma,screenAngle(),+$('trim').value);
+  const want=abs?'ok':'rel';
+  if(diag.compass!==want){diag.compass=want;renderDiag();
+    if(!abs)setStatus('Compass is relative on this device — no true north. Use Heading trim to line the overlay up with a landmark.','err');}
+  $('hBrg').textContent=Math.round(heading).toString().padStart(3,'0')+'°';
+  $('hElv').textContent=Math.round(elevation)+'°';
 }
 
 /* ============================ data sources ============================ */
@@ -742,7 +833,6 @@ $('starUrl').addEventListener('change',async e=>{
 /* recompute all known object az/el */
 function refreshSky(){
   if(!me)return;
-  loadAircraft();
   const now=new Date(),k=[];
   const sun=bodyAzAlt(sunCoords(toDays(now)),now,me.lat,me.lon);
   if(sun.alt>-2)k.push({name:'Sun',az:sun.az,el:sun.alt,color:'var(--sun)',kind:'sun'});
@@ -788,19 +878,50 @@ function refreshSky(){
 }
 
 /* ============================ projection + overlay ============================ */
+/* tan(half-FOV) per screen axis. object-fit:cover scales the video uniformly, so one
+   focal length serves both axes: derive each angle from the camera's long-axis FOV
+   and how much of the frame the viewport actually shows. */
+function updateFov(){
+  const W=overlay.width,H=overlay.height,cam=(+$('fov').value)*D2R;
+  const vw=video.videoWidth||0,vh=video.videoHeight||0;
+  let tx,ty;
+  if(vw&&vh){
+    const fpx=(Math.max(vw,vh)/2)/Math.tan(cam/2);   // focal length in video pixels
+    const s=Math.max(W/vw,H/vh);                     // object-fit:cover scale
+    tx=(W/s/2)/fpx; ty=(H/s/2)/fpx;
+  }else{                                             // no camera: fit the FOV to the viewport
+    const L=Math.max(W,H),t=Math.tan(cam/2);
+    tx=t*W/L; ty=t*H/L;
+  }
+  FOV={tx,ty};
+}
+/* gnomonic projection through the live camera basis — exact at any aim, including
+   straight up, and it carries roll and landscape for free. */
 function project(az,el){
-  if(heading==null||elevation==null)return null;
-  const fov=+$('fov').value, trim=+$('trim').value;
-  const cAz=rev(heading+trim), cEl=elevation;
-  let dAz=shortAngle(az-cAz)*Math.cos(cEl*D2R), dEl=el-cEl;
-  const fovY=fov*overlay.height/overlay.width;
-  let nx=dAz/(fov/2), ny=-dEl/(fovY/2);
-  const rr=-roll*D2R, cx=nx*Math.cos(rr)-ny*Math.sin(rr), cy=nx*Math.sin(rr)+ny*Math.cos(rr);
-  if(Math.abs(cx)>1.15||Math.abs(cy)>1.15)return null;
-  return{x:overlay.width/2+cx*overlay.width/2, y:overlay.height/2+cy*overlay.height/2};
+  if(!basis)return null;
+  const ce=Math.cos(el*D2R);
+  const tE=Math.sin(az*D2R)*ce, tN=Math.cos(az*D2R)*ce, tU=Math.sin(el*D2R);
+  const f=basis.f, d=tE*f[0]+tN*f[1]+tU*f[2];
+  if(d<=0.03)return null;                            // at or behind the image plane
+  const r=basis.r, u=basis.u;
+  const x=(tE*r[0]+tN*r[1]+tU*r[2])/d/FOV.tx;
+  const y=-(tE*u[0]+tN*u[1]+tU*u[2])/d/FOV.ty;
+  if(Math.abs(x)>1.2||Math.abs(y)>1.2)return null;
+  return{x:overlay.width/2+x*overlay.width/2, y:overlay.height/2+y*overlay.height/2};
+}
+/* screen pixel -> az/el: the exact inverse of project() */
+function unproject(px,py,b,fv){
+  b=b||basis; fv=fv||FOV; if(!b)return null;
+  const x=(px/(overlay.width/2)-1)*fv.tx, y=-(py/(overlay.height/2)-1)*fv.ty;
+  const v=[b.f[0]+x*b.r[0]+y*b.u[0],
+           b.f[1]+x*b.r[1]+y*b.u[1],
+           b.f[2]+x*b.r[2]+y*b.u[2]];
+  const n=Math.hypot(v[0],v[1],v[2]);
+  return{az:rev(Math.atan2(v[0],v[1])*R2D), el:Math.asin(v[2]/n)*R2D};
 }
 function drawOverlay(){
   octx.clearRect(0,0,overlay.width,overlay.height);
+  updateFov();
   const lim=+$('smag').value;
 
   /* constellation lines (drawn under everything) */
@@ -882,21 +1003,27 @@ function drawOverlay(){
   octx.beginPath();octx.moveTo(overlay.width/2-14,overlay.height/2);octx.lineTo(overlay.width/2+14,overlay.height/2);
   octx.moveTo(overlay.width/2,overlay.height/2-14);octx.lineTo(overlay.width/2,overlay.height/2+14);octx.stroke();
   knowns.forEach(o=>{const p=project(o.az,o.el);if(!p)return;
-    const col=getComputedStyle(document.documentElement).getPropertyValue(o.color.replace('var(','').replace(')',''))||'#fff';
+    const col=cssColor(o.color);
     octx.strokeStyle=col;octx.fillStyle=col;octx.lineWidth=1.5;
     octx.beginPath();octx.arc(p.x,p.y,o.kind==='sun'||o.kind==='moon'?13:8,0,7);octx.stroke();
     octx.font='10px ui-monospace';octx.fillText(o.name,p.x+11,p.y+3);});
 }
 
-/* ============================ detection loop ============================ */
+/* ============================ render + detection loop ============================ */
+/* The overlay runs on its own: the sky map still works when the camera is
+   unavailable or denied, and only the motion detector needs a live video frame. */
 const GW=proc.width,GH=proc.height,NPX=GW*GH;
+let rafOn=false;
+function startLoop(){if(!rafOn){rafOn=true;requestAnimationFrame(loop);}}
 function loop(){
-  if(!running)return;
-  pctx.drawImage(video,0,0,GW,GH);
-  const cur=pctx.getImageData(0,0,GW,GH).data,gray=new Float32Array(NPX);
-  for(let i=0,p=0;i<NPX;i++,p+=4)gray[i]=cur[p]*0.299+cur[p+1]*0.587+cur[p+2]*0.114;
+  let gray=null;
+  if(running){
+    pctx.drawImage(video,0,0,GW,GH);
+    const cur=pctx.getImageData(0,0,GW,GH).data;gray=new Float32Array(NPX);
+    for(let i=0,p=0;i<NPX;i++,p+=4)gray[i]=cur[p]*0.299+cur[p+1]*0.587+cur[p+2]*0.114;
+  }
   drawOverlay();
-  if(prev){
+  if(gray&&prev){
     const thr=+$('sens').value;let changed=0,best=-1,bx=0,by=0;
     for(let y=0;y<GH;y++)for(let x=0;x<GW;x++){const i=y*GW+x,d=gray[i]-prev[i];
       if(d>thr&&gray[i]>70){changed++;if(d>best){best=d;bx=x;by=y;}}}
@@ -924,13 +1051,16 @@ $('capture').addEventListener('click',()=>{
   const url=cap.toDataURL('image/png');
   const img=$('shot');img.src=url;img.style.display='block';
   const a=document.createElement('a');a.href=url;a.download='skywatch-'+Date.now()+'.png';a.click();
-  analyze(cap);switchTab('an');
+  /* freeze the aim used for this frame — the phone keeps moving while we analyse */
+  analyze(cap, basis&&{f:basis.f.slice(),r:basis.r.slice(),u:basis.u.slice()},
+          {tx:FOV.tx,ty:FOV.ty});
+  switchTab('an');
   setStatus('Still saved. Long-press the thumbnail to keep it. Image data extracted below.','ok');
 });
 
 /* ============================ image analysis ============================ */
 let analysis=null;
-function analyze(cap){
+function analyze(cap,aimBasis,aimFov){
   const AW=256,AH=Math.round(256*cap.height/cap.width);
   const c=document.createElement('canvas');c.width=AW;c.height=AH;
   const ctx=c.getContext('2d',{willReadFrequently:true});ctx.drawImage(cap,0,0,AW,AH);
@@ -948,9 +1078,8 @@ function analyze(cap){
   pts.sort((a,b)=>b.L-a.L);const keep=[];
   pts.forEach(pt=>{if(!keep.some(k=>Math.abs(k.x-pt.x)<4&&Math.abs(k.y-pt.y)<4))keep.push(pt);});
   const top=keep.slice(0,12);
-  // pixel -> az/el using pointing at capture time
-  const fov=+$('fov').value,fovY=fov*AH/AW,trim=+$('trim').value;
-  const cAz=heading==null?null:rev(heading+trim),cEl=elevation;
+  // pixel -> az/el through the aim frozen at capture time
+  const aim=aimBasis?unproject(overlay.width/2,overlay.height/2,aimBasis,aimFov):null;
   // candidate set for matching: dynamic knowns + full-catalog sats + stars + deep sky
   const engC=engineVisible()
     .filter(o=>o.el*R2D>0&&(o.type==='P'||on('debris')))
@@ -959,11 +1088,9 @@ function analyze(cap){
     starsUp.filter(s=>s.mag<=+$('smag').value+0.5).map(s=>({name:s.name,az:s.az,el:s.el,kind:'star'})),
     dsoUp.map(o=>({name:o.name,az:o.az,el:o.el,kind:'dso'})));
   top.forEach(pt=>{
-    const nx=(pt.x/AW*2-1), ny=(pt.y/AH*2-1);
-    const rr=roll*D2R, ux=nx*Math.cos(rr)-ny*Math.sin(rr), uy=nx*Math.sin(rr)+ny*Math.cos(rr);
-    if(cAz==null){pt.az=null;pt.el=null;return;}
-    pt.az=rev(cAz+ux*(fov/2)/Math.max(.2,Math.cos(cEl*D2R)));
-    pt.el=cEl-uy*(fovY/2);
+    const q=aimBasis?unproject(pt.x/AW*overlay.width,pt.y/AH*overlay.height,aimBasis,aimFov):null;
+    if(!q){pt.az=null;pt.el=null;return;}
+    pt.az=q.az;pt.el=q.el;
     // match to candidates within 6°
     let bestM=null,bd=6;
     cands.forEach(o=>{const da=shortAngle(o.az-pt.az),de=o.el-pt.el,dist=Math.hypot(da,de);
@@ -973,12 +1100,15 @@ function analyze(cap){
   analysis={mean:mean.toFixed(1),count:top.length,pts:top,
     when:new Date().toLocaleTimeString(),
     gps:me?`${me.lat.toFixed(4)}, ${me.lon.toFixed(4)}`:'—',
-    aim:cAz==null?'—':`${Math.round(cAz)}° / ${Math.round(cEl)}°`,
+    aim:aim?`${Math.round(aim.az)}° / ${Math.round(aim.el)}°`:'—',
     moon:(()=>{const il=moonIllum(new Date());return `${Math.round(il.fraction*100)}% ${phaseName(il.phase)}`;})()};
 }
 
 /* ============================ panels ============================ */
-function cssColor(v){return getComputedStyle(document.documentElement).getPropertyValue(v.replace('var(','').replace(')',''))||'#fff';}
+const _colCache={};
+function cssColor(v){const k=v.replace('var(','').replace(')','');
+  return _colCache[k]||(_colCache[k]=
+    (getComputedStyle(document.documentElement).getPropertyValue(k)||'').trim()||'#fff');}
 function renderSheet(){
   const b=$('sheetBody');
   if(tab==='sky'){
@@ -1037,8 +1167,11 @@ SATENGINE.init({
   onReady:(c)=>{
     engineReady=true;diag.sat=c+' cat';renderDiag();
     if(me)SATENGINE.setObserver(me.lat,me.lon,me.alt||300);
-    SATENGINE.start();
-    setStatus(c+' catalog objects tracking. Sunlit payloads drawn bright; tap Debris for rocket bodies + junk.','ok');
+    SATENGINE.start();startLoop();
+    /* the catalog finishes loading long after the first taps — don't wipe a location
+       or camera error the user still needs to read */
+    if(!statusIsError())
+      setStatus(c+' catalog objects tracking. Sunlit payloads drawn bright; tap Debris for rocket bodies + junk.','ok');
   },
   onError:(m)=>{
     diag.sat='no cat';renderDiag();
