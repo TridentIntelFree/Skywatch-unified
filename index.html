@@ -32,7 +32,8 @@
 
   #dock{position:absolute;left:0;right:0;bottom:0;z-index:6;
     background:linear-gradient(0deg,rgba(8,11,17,.95),rgba(8,11,17,.55) 75%,transparent);
-    padding:.55rem .7rem calc(.55rem + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:.5rem}
+    padding:.55rem .7rem calc(.55rem + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:.5rem;
+    max-height:72vh;overflow-y:auto;-webkit-overflow-scrolling:touch}
   .btnrow{display:flex;gap:.4rem;flex-wrap:wrap}
   button{font:inherit;font-size:.6rem;letter-spacing:.08em;text-transform:uppercase;
     background:var(--panel);color:var(--ink);border:1px solid var(--line);
@@ -56,8 +57,14 @@
   .tab{flex:1;text-align:center;font-size:.55rem;padding:.4rem;border:1px solid var(--line);
     border-radius:.4rem;color:var(--dim);text-transform:uppercase;letter-spacing:.1em}
   .tab[aria-selected="true"]{color:var(--ink);border-color:var(--lock)}
-  #sheet{max-height:34vh;overflow-y:auto;font-size:.58rem;line-height:1.55;display:none}
+  #sheet{max-height:30vh;overflow-y:auto;font-size:.58rem;line-height:1.55;display:none}
   #sheet.open{display:block}
+  /* Advanced controls stay folded away: this is a camera app, and the sky is the point. */
+  #setup{display:none;flex-direction:column;gap:.5rem}
+  #setup.open{display:flex}
+  .caret{flex:0 0 auto;width:2.1rem;padding:.35rem;font-size:.75rem;line-height:1;
+    color:var(--dim);transition:transform .15s ease}
+  .caret[aria-expanded="false"]{transform:rotate(-90deg)}
   .obj{display:flex;justify-content:space-between;gap:.5rem;padding:.15rem 0;border-bottom:1px solid rgba(28,39,50,.5)}
   .obj .nm{color:var(--ink)} .obj .v{color:var(--dim);font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
   .dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;margin-right:.35rem;vertical-align:middle}
@@ -94,9 +101,11 @@
     <div class="tab" id="tabSky" aria-selected="true">Sky now</div>
     <div class="tab" id="tabAn" aria-selected="false">Image data</div>
     <div class="tab" id="tabLock" aria-selected="false">Lock</div>
+    <button class="caret" id="sheetToggle" aria-expanded="true" aria-label="Collapse the list">⌄</button>
   </div>
   <div id="sheet" class="open"><div id="sheetBody" class="hint">Start the camera to populate.</div></div>
 
+  <div id="setup">
   <div class="btnrow">
     <button class="tog" id="tStars" data-on="1">Stars</button>
     <button class="tog" id="tLines" data-on="1">Lines</button>
@@ -115,15 +124,18 @@
     <div class="slide"><label>Manual lat,lon</label><input type="text" id="manual" placeholder="e.g. 36.90,-82.00 — use if GPS won't prompt"></div>
   </div>
 
+  <div class="btnrow"><button id="loadSat">Load sats from URL</button></div>
+
   <div id="diag" class="hint">GPS — · CMP — · AIR — · SAT — · STR emb · secure —</div>
+  </div>
 
   <div class="btnrow">
     <button id="geo" class="primary">Location</button>
     <button id="start" class="primary">Camera</button>
     <button id="sensors">Compass</button>
-    <button id="loadSat">Load sats</button>
     <button id="lock" disabled>Lock</button>
     <button id="capture" disabled>Shot</button>
+    <button class="tog" id="setupToggle" data-on="0">Setup</button>
   </div>
 </div>
 
@@ -622,13 +634,37 @@ Object.values(tog).forEach(b=>b.addEventListener('click',()=>{
 const on=k=>tog[k].dataset.on==='1';
 
 /* tabs */
-$('tabSky').addEventListener('click',()=>switchTab('sky'));
-$('tabAn').addEventListener('click',()=>switchTab('an'));
-$('tabLock').addEventListener('click',()=>switchTab('lock'));
+/* Collapse state is per-device and remembered; a browser that refuses storage
+   just falls back to the defaults. */
+const remember=(k,v)=>{try{localStorage.setItem(k,v?'1':'0');}catch(e){}};
+const recall=(k,d)=>{try{const v=localStorage.getItem(k);return v==null?d:v==='1';}catch(e){return d;}};
+function setSheetOpen(o){
+  $('sheet').classList.toggle('open',o);
+  $('sheetToggle').setAttribute('aria-expanded',o?'true':'false');
+  $('sheetToggle').setAttribute('aria-label',o?'Collapse the list':'Expand the list');
+  remember('sw.sheet',o);
+}
+function setSetupOpen(o){
+  $('setup').classList.toggle('open',o);
+  $('setupToggle').dataset.on=o?'1':'0';
+  remember('sw.setup',o);
+}
+$('sheetToggle').addEventListener('click',()=>setSheetOpen(!$('sheet').classList.contains('open')));
+$('setupToggle').addEventListener('click',()=>setSetupOpen(!$('setup').classList.contains('open')));
+
+/* Tapping a tab means you want to read it, so it also opens a collapsed sheet.
+   Switching tabs from code (a new lock) does not — it must never cover the sky
+   you are pointing at. */
+$('tabSky').addEventListener('click',()=>{switchTab('sky');setSheetOpen(true);});
+$('tabAn').addEventListener('click',()=>{switchTab('an');setSheetOpen(true);});
+$('tabLock').addEventListener('click',()=>{switchTab('lock');setSheetOpen(true);});
 let tab='sky';
 function switchTab(t){tab=t;$('tabSky').setAttribute('aria-selected',t==='sky');
   $('tabAn').setAttribute('aria-selected',t==='an');
   $('tabLock').setAttribute('aria-selected',t==='lock');renderSheet();}
+
+setSheetOpen(recall('sw.sheet',true));
+setSetupOpen(recall('sw.setup',false));
 
 /* ============================ diagnostics ============================ */
 const diag={gps:'—',compass:'—',air:'—',sat:'—',str:STARS.length+' emb'};
@@ -665,29 +701,30 @@ function applyPos(p){
 }
 function geoFail(e){
   if(geoNudge){clearTimeout(geoNudge);geoNudge=null;}
+  setSetupOpen(true);          // these messages send you to the manual field — show it
   const code=e&&e.code;
   diag.gps=code===1?'denied':code===3?'timeout':'unavail';renderDiag();
   if(code===1){
     setStatus('Location permission denied. On iPhone: Settings → Privacy & Security → Location Services → '+
       'make sure it is On and Safari Websites is "While Using", then reload and tap Location again. '+
-      'Otherwise type lat,lon in the manual field.','err');
+      'Otherwise type lat,lon in the manual field under Setup.','err');
   }else if(code===3){
     setStatus('No position fix yet — GPS can be slow indoors. Move near a window or outside and tap Location '+
-      'again, or type lat,lon in the manual field.','err');
+      'again, or type lat,lon in the manual field under Setup.','err');
   }else{
     setStatus('Location unavailable'+(e&&e.message?' ('+e.message+')':'')+
-      '. Type lat,lon in the manual field to carry on.','err');
+      '. Type lat,lon in the manual field under Setup to carry on.','err');
   }
 }
 $('geo').addEventListener('click',()=>{
-  if(!navigator.geolocation){diag.gps='no api';renderDiag();
-    setStatus('No geolocation API in this browser. Type coordinates in the manual field.','err');return;}
-  if(!window.isSecureContext){diag.gps='insecure';renderDiag();
+  if(!navigator.geolocation){diag.gps='no api';renderDiag();setSetupOpen(true);
+    setStatus('No geolocation API in this browser. Type coordinates in the manual lat,lon field under Setup.','err');return;}
+  if(!window.isSecureContext){diag.gps='insecure';renderDiag();setSetupOpen(true);
     setStatus('Location needs a secure page. Open the https:// address in the browser — a file:// or plain '+
-      'http:// copy can never get a fix. Manual lat,lon works anywhere.','err');return;}
+      'http:// copy can never get a fix. The manual lat,lon field under Setup works anywhere.','err');return;}
   if(window.self!==window.top){
     setStatus('This page is inside a frame, where iOS refuses location. Open it directly in Safari, '+
-      'or type lat,lon in the manual field.','err');
+      'or type lat,lon in the manual field under Setup.','err');
   }
   setStatus('Requesting location — accept the prompt. The first fix can take a few seconds.');
   /* No timeout on the first call: the permission prompt itself can outlast any timer,
@@ -702,8 +739,9 @@ $('geo').addEventListener('click',()=>{
   }
   if(geoNudge)clearTimeout(geoNudge);
   geoNudge=setTimeout(()=>{
+    if(!me)setSetupOpen(true);
     if(!me)setStatus('Still waiting on a fix. If no permission prompt appeared, this page may be in an '+
-      'in-app browser or a preview — open the https address in Safari itself. Manual lat,lon always works.','err');
+      'in-app browser or a preview — open the https address in Safari itself. The manual lat,lon field under Setup always works.','err');
   },20000);
 });
 $('manual').addEventListener('change',e=>{
