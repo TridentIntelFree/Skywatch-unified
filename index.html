@@ -205,6 +205,7 @@
     <div class="btnrow">
       <button class="tog" id="stackBtn" data-on="0" disabled>Stack</button>
       <button id="solve" disabled>Solve</button>
+      <button class="tog" id="scanBtn" data-on="0" disabled>Scan</button>
       <button id="lock" disabled>Lock</button>
       <button id="capture" disabled>Shot</button>
     </div>
@@ -679,8 +680,10 @@ let me=null, heading=null, elevation=null, running=false;
 let basis=null,rawBasis=null; // {f,r,u}: camera forward, screen right, screen up — earth [E,N,U]
 let FOV={tx:0.67,ty:1.45},RAWFOV={tx:0.67,ty:1.45};  // tan(half-FOV) per screen axis
 let prev=null, hitCount=0, cooldown=0;
-/* Declared here rather than beside their modules: fit() and renderDiag() both run
-   while the script is still evaluating, and would hit the temporal dead zone. */
+/* EVERY module's state object lives here, not beside its module. fit(), renderDiag()
+   and renderBar() all run while the script is still evaluating, and a `const` declared
+   further down is in the temporal dead zone at that moment — one read throws and kills
+   every remaining line of the script. Add new module state to this block. */
 const SOLVE_TTL=240;         // s — magnetometer bias drifts, and so does a correction for it
 const SOLVE={R:null,rms:null,nStars:0,scale:1,t:0,fail:null,busy:false};
 const solveAgeS=()=>SOLVE.R?(Date.now()-SOLVE.t)/1000:null;
@@ -688,7 +691,9 @@ const solveLive=()=>!!SOLVE.R&&(Date.now()-SOLVE.t)<SOLVE_TTL*1000;
 const STACK={on:false,n:0,ref:null,fov:null,acc:null,actx:null,ctx:null,
              drift:6,lastPaint:0};
 const LOCK={on:false,samples:[],rad:14,started:0,verdict:null,lastCalc:0,
-            lastSeen:0,seed:{x:0,y:0}};
+            lastSeen:0,seed:{x:0,y:0},pol:1,starPsf:null};
+const SCAN={on:false,events:[],occ:[],last:0,dcur:null,dctx:null,dref:null,rctx:null,
+            base:new Map(),globalDim:false,noise:0,nStars:0};
 let aircraft=[], satrecs=[], knowns=[];   // knowns: {name,az,el,color,kind}
 let starsUp=[], dsoUp=[], radUp=[];       // fixed-sky layers, refreshed with knowns
 let lastCapture=null;
@@ -779,6 +784,8 @@ function renderChips(){
   c.push(chipHtml(engineReady?'SAT '+Math.round(SATENGINE.stats().visible/100)/10+'k':'SAT …',
                   engineReady?'ok':'warn'));
   if(STACK.on)c.push(chipHtml('STACK '+STACK.n,'ok'));
+  if(SCAN.on)c.push(chipHtml('SCAN '+scanConfirmed().length,
+    scanConfirmed().length?'warn':'ok'));
   $('chips').innerHTML=c.join('');
 }
 function nextStep(){
@@ -908,7 +915,7 @@ $('start').addEventListener('click',async()=>{
     video.srcObject=s;await video.play();running=true;
     $('start').textContent='Live';$('start').disabled=true;
     $('capture').disabled=false;$('lock').disabled=false;
-    $('solve').disabled=false;$('stackBtn').disabled=false;
+    $('solve').disabled=false;$('stackBtn').disabled=false;$('scanBtn').disabled=false;
     setStatus('Live. Full sky overlaid; moving lights flagged. No video is recorded — stills only.','ok');
     startLoop();refreshSky();
   }catch(e){setStatus('Camera blocked: '+e.message+' — needs HTTPS + permission. '+
@@ -1248,6 +1255,30 @@ function drawOverlay(){
     }
   }
 
+  /* scan detections: dashed for a dark shape, solid for an unexplained light */
+  if(SCAN.on){
+    octx.font='9px ui-monospace';
+    scanConfirmed().forEach(ev=>{
+      const p=project(ev.az,ev.el);if(!p)return;
+      const dark=ev.sign<0;
+      octx.strokeStyle=dark?pal('dso'):pal('warn');
+      octx.fillStyle=octx.strokeStyle;
+      octx.lineWidth=1.6;
+      octx.setLineDash(dark?[4,3]:[]);
+      octx.strokeRect(p.x-13,p.y-13,26,26);
+      octx.setLineDash([]);
+      octx.fillText((dark?'DARK ':'CHANGE ')+ev.n,p.x+17,p.y-9);
+    });
+    octx.strokeStyle=pal('rad',.9);octx.lineWidth=1.4;
+    SCAN.occ.slice(-4).forEach(o=>{
+      if(Date.now()-o.t>6000)return;
+      const p=project(o.az,o.el);if(!p)return;
+      octx.beginPath();octx.arc(p.x,p.y,15,0,7);octx.stroke();
+      octx.fillStyle=pal('rad',.9);
+      octx.fillText('occulted '+Math.round(o.ms)+'ms',p.x+18,p.y+3);
+    });
+  }
+
   // center reticle
   octx.strokeStyle=pal('lock',.25);octx.lineWidth=1;
   octx.beginPath();octx.moveTo(overlay.width/2-14,overlay.height/2);octx.lineTo(overlay.width/2+14,overlay.height/2);
@@ -1319,11 +1350,10 @@ function stackFrame(){
   if(angBetween(basis.f,STACK.ref.f)>STACK.drift){resetStack();return;}
   const M=alignAffine();
   if(!M)return;
-  const k=Math.max(W/vw,H/vh),cw=W/k,ch=H/k;
   STACK.actx.save();
   STACK.actx.setTransform(M.a,M.b,M.c,M.d,M.e,M.f);
   STACK.actx.globalAlpha=1/(STACK.n+1);        // running mean, so noise falls as sqrt(n)
-  STACK.actx.drawImage(video,(vw-cw)/2,(vh-ch)/2,cw,ch,0,0,W,H);
+  drawCameraFrame(STACK.actx,W,H);
   STACK.actx.restore();
   STACK.n++;
   const now=Date.now();
@@ -1436,7 +1466,13 @@ function wahba(obs,cat){
   }
   return R;
 }
-/* brightest local maxima in a frame, as screen coordinates with subpixel centroids */
+/* Blob finder, either polarity. pol=+1 finds a light against dark sky, pol=-1 finds a
+   dark shape against a lighter background — the app could previously only ever see the
+   first. peak/bg are returned in polarity space so peak-bg is always a positive
+   contrast and the photometry needs no special case.
+   `width` is the intensity-weighted RMS radius: compared against stars in the same
+   frame it separates a point at infinity from something a few metres away, which is
+   what most phone-camera "UFOs" turn out to be. */
 function extractSources(gray,maxN){
   let sum=0;for(let i=0;i<NPX;i++)sum+=gray[i];
   const mean=sum/NPX;
@@ -1569,21 +1605,51 @@ function angSepDeg(az1,el1,az2,el2){
   return Math.acos(Math.min(1,Math.max(-1,c)))*R2D;
 }
 /* brightest point in a window, refined to a brightness-weighted centroid */
-function findBlob(gray,cx,cy,rad){
+function findBlob(gray,cx,cy,rad,pol,minC){
+  pol=pol||1; minC=minC==null?6:minC;
   const x0=Math.max(0,Math.round(cx-rad)),x1=Math.min(GW-1,Math.round(cx+rad));
   const y0=Math.max(0,Math.round(cy-rad)),y1=Math.min(GH-1,Math.round(cy+rad));
   if(x1<=x0||y1<=y0)return null;
-  let best=-1,bx=cx,by=cy,sum=0,n=0;
+  let best=-1e9,bx=cx,by=cy,sum=0,n=0;
   for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++){
-    const v=gray[y*GW+x];sum+=v;n++;if(v>best){best=v;bx=x;by=y;}}
+    const v=gray[y*GW+x]*pol;sum+=v;n++;if(v>best){best=v;bx=x;by=y;}}
   const bg=sum/n;
-  if(best-bg<6)return null;                       // nothing stands out from the sky
+  if(best-bg<minC)return null;                    // nothing stands out from the sky
   let sw=0,sx=0,sy=0;
   for(let y=Math.max(0,by-2);y<=Math.min(GH-1,by+2);y++)
     for(let x=Math.max(0,bx-2);x<=Math.min(GW-1,bx+2);x++){
-      const w=Math.max(0,gray[y*GW+x]-bg);sw+=w;sx+=w*x;sy+=w*y;}
+      const w=Math.max(0,gray[y*GW+x]*pol-bg);sw+=w;sx+=w*x;sy+=w*y;}
   if(sw<=0)return null;
-  return{x:sx/sw,y:sy/sw,peak:best,bg};
+  const cx2=sx/sw,cy2=sy/sw;
+  let sw2=0,sr2=0;                                // second moment -> RMS radius
+  for(let y=Math.max(0,Math.round(cy2)-4);y<=Math.min(GH-1,Math.round(cy2)+4);y++)
+    for(let x=Math.max(0,Math.round(cx2)-4);x<=Math.min(GW-1,Math.round(cx2)+4);x++){
+      const w=Math.max(0,gray[y*GW+x]*pol-bg),ddx=x-cx2,ddy=y-cy2;
+      sw2+=w;sr2+=w*(ddx*ddx+ddy*ddy);}
+  return{x:cx2,y:cy2,peak:best,bg,contrast:best-bg,
+         width:sw2>0?Math.sqrt(sr2/sw2):null};
+}
+/* Median blur width of catalogue stars in the same frame. Stars are at infinity, so
+   they are the frame's own point-spread reference — same optics, same focus, same
+   instant, which makes the comparison self-calibrating. */
+function starPsf(gray){
+  if(!basis||!starsUp.length)return null;
+  const w=[];
+  for(const st of starsUp){
+    if(st.el<=0||st.mag>3.5)continue;
+    const p=project(st.az,st.el);if(!p)continue;
+    const q=screenToProc(p.x,p.y);
+    const b=findBlob(gray,q.x,q.y,4,1,8);
+    if(b&&b.width!=null)w.push(b.width);
+    if(w.length>=12)break;
+  }
+  if(w.length<3)return null;
+  w.sort((a,b)=>a-b);
+  const med=w[w.length>>1];
+  /* Under-sampled stars give a width near zero and the ratio becomes meaningless.
+     Declining to judge beats inventing a hundredfold blur. */
+  if(!(med>=0.3))return null;
+  return{med,n:w.length};
 }
 function dropLock(why){
   LOCK.on=false;LOCK.samples=[];LOCK.verdict=null;
@@ -1591,16 +1657,17 @@ function dropLock(why){
   if(why)setStatus('Lock dropped — '+why+'.','');
   renderSheet();
 }
-function startLock(sx,sy){
+function startLock(sx,sy,pol){
   if(!running){setStatus('Start the camera before locking onto a light.','err');return;}
   if(!basis){setStatus('Turn the compass on first — a lock has to be placed on the sky, not the screen.','err');return;}
   if(!lastGray){setStatus('No camera frame yet — give it a moment.','err');return;}
   const q=screenToProc(sx,sy);
-  const bl=findBlob(lastGray,q.x,q.y,24);
+  const bl=findBlob(lastGray,q.x,q.y,24,pol||1);
   /* Arm even with nothing visible right now: an aircraft beacon is dark most of the
      time, and demanding a light at the instant of the tap would refuse exactly the
      targets worth locking. The tracker gets a few seconds to acquire. */
-  LOCK.on=true;LOCK.samples=[];LOCK.started=Date.now();LOCK.lastSeen=Date.now();
+  LOCK.on=true;LOCK.pol=pol||1;LOCK.starPsf=null;
+  LOCK.samples=[];LOCK.started=Date.now();LOCK.lastSeen=Date.now();
   LOCK.seed=bl?{fx:bl.x/GW,fy:bl.y/GH}:{fx:q.x/GW,fy:q.y/GH};
   LOCK.verdict=null;LOCK.lastCalc=0;
   $('lock').textContent='Drop';$('lock').classList.add('primary');
@@ -1621,7 +1688,7 @@ function trackLock(gray,rgb){
     const q=screenToProc(p.x,p.y);px=q.x;py=q.y;predAz=last.az;predEl=last.el;
   }else if(last){px=last.sx;py=last.sy;}
   else{px=LOCK.seed.fx*GW;py=LOCK.seed.fy*GH;}
-  const bl=findBlob(gray,px,py,S.length?LOCK.rad:24);
+  const bl=findBlob(gray,px,py,S.length?LOCK.rad:24,LOCK.pol);
   if(!bl){
     if(now-LOCK.lastSeen>4000){dropLock('lost the light for four seconds');return;}
     /* Between flashes the target is still the target. Record the gap as a dark
@@ -1637,9 +1704,13 @@ function trackLock(gray,rgb){
   const i=(Math.min(GH-1,Math.max(0,Math.round(bl.y)))*GW+
            Math.min(GW-1,Math.max(0,Math.round(bl.x))))*4;
   S.push({t:Date.now(),az:q?q.az:null,el:q?q.el:null,sx:bl.x,sy:bl.y,
-          peak:bl.peak,bg:bl.bg,r:rgb[i],g:rgb[i+1],b:rgb[i+2]});
+          peak:bl.peak,bg:bl.bg,width:bl.width,r:rgb[i],g:rgb[i+1],b:rgb[i+2]});
   if(S.length>300)S.shift();
-  if(now-LOCK.lastCalc>500){LOCK.lastCalc=now;LOCK.verdict=assess();}
+  if(now-LOCK.lastCalc>500){
+    LOCK.lastCalc=now;
+    LOCK.starPsf=starPsf(gray);        // reference measured from this very frame
+    LOCK.verdict=assess();
+  }
 }
 /* least-squares sky-track velocity over the recent window */
 function trackStats(){
@@ -1708,7 +1779,17 @@ function rateAgrees(obs,cand){
   const hi=Math.max(obs,cand),lo=Math.min(obs,cand);
   return lo>0?(hi/lo)<=2.5:false;
 }
-function behaviour(st,ph){
+/* how wide the tracked object is against the frame's own stars */
+function psfRatio(){
+  const ref=LOCK.starPsf;
+  if(!ref)return null;
+  const w=LOCK.samples.filter(s=>!s.dark&&s.width!=null).slice(-20).map(s=>s.width);
+  if(w.length<4)return null;
+  w.sort((a,b)=>a-b);
+  const med=w[w.length>>1];
+  return{ratio:med/ref.med, obj:med, star:ref.med, nStars:ref.n};
+}
+function behaviour(st,ph,psf){
   const r=st.rate;let s;
   if(r<0.02)      s='holding still against the stars — a star, planet, or a fixed distant light';
   else if(r<0.15) s='drifting slowly — a high aircraft, a satellite low on the horizon, or a balloon';
@@ -1719,6 +1800,13 @@ function behaviour(st,ph){
     s+='; strobing near '+ph.flashHz.toFixed(1)+' Hz, which is how aircraft anti-collision beacons read';
   else if(ph&&ph.cv>0.45)
     s+='; brightness swinging widely — tumbling, flaring, or scintillation low in the sky';
+  if(psf&&psf.ratio>=1.6)
+    s+='. It is '+psf.ratio.toFixed(1)+'x wider than the '+psf.nStars+
+       ' stars measured in the same frame, so it is not focused at infinity — that is '+
+       'an insect, dust on the lens, or a bird within a few metres, not anything at altitude';
+  else if(psf)
+    s+='. Blur width matches the stars in frame ('+psf.ratio.toFixed(2)+
+       'x), so it is focused at distance';
   return s;
 }
 
@@ -1783,31 +1871,48 @@ function assess(){
      orbit and nothing in the star catalogue does it, so a strobe rules those out even
      when the position and rate would otherwise fit. */
   const strobing=!!(ph&&ph.flashHz>=0.5&&ph.flashHz<=3&&ph.duty<0.8);
+  /* Resolved against the stars in the same frame means it is not at infinity. Nothing
+     in orbit and nothing in the star catalogue can be a few metres from the lens, so a
+     wide blur rules them out however well the position fits — this is the signature of
+     an insect, dust, or a bird, which is the commonest phone-camera false alarm. */
+  const psf=psfRatio();
+  const nearField=!!(psf&&psf.ratio>=1.6);
   const NOT_STROBERS={sat:1,star:1,dso:1,planet:1,moon:1,sun:1};
   list.forEach(c=>{
     c.rateOk=rateAgrees(st.rate,c.rate);
-    c.vetoed=strobing&&!!NOT_STROBERS[c.kind];
+    c.vetoed=(strobing||nearField)&&!!NOT_STROBERS[c.kind];
   });
   const inGate=list.filter(c=>c.sep<=c.gate);
   const agree=inGate.filter(c=>c.rateOk===true&&!c.vetoed);
   let label,best=null,kind;
   if(agree.length){best=agree[0];label=best.name;kind='match';}
+  else if(nearField){label='NEAR THE LENS';kind='near';}
   else if(strobing){label='UNIDENTIFIED';kind='none';}   // beacon, but nothing in the feed fits
   else if(inGate.length){best=inGate[0];label='motion disagrees';kind='conflict';}
   else{label='UNIDENTIFIED';kind='none';}
   /* Ruling everything out requires data good enough to have found a match. Without it
      the honest answer is that the question cannot be settled, not that it is a mystery. */
   if(kind==='none'&&Q.blocking.length){kind='insufficient';label='CANNOT ADJUDICATE';best=null;}
-  return{label,kind,best,list,st,ph,pos:last,strobing,Q,note:behaviour(st,ph)};
+  return{label,kind,best,list,st,ph,pos:last,strobing,nearField,psf,Q,
+         note:behaviour(st,ph,psf)};
 }
 
 overlay.addEventListener('pointerdown',e=>{
   if(!running)return;
   const r=overlay.getBoundingClientRect();
-  startLock(e.clientX-r.left,e.clientY-r.top);
+  const x=e.clientX-r.left,y=e.clientY-r.top;
+  /* tapping a dark detection tracks the silhouette, not the sky behind it */
+  let pol=1;
+  for(const ev of scanConfirmed()){
+    if(ev.sign>0)continue;
+    const p=project(ev.az,ev.el);
+    if(p&&Math.hypot(p.x-x,p.y-y)<44){pol=-1;break;}
+  }
+  startLock(x,y,pol);
 });
 $('solve').addEventListener('click',solveNow);
 $('stackBtn').addEventListener('click',()=>setStack(!STACK.on));
+$('scanBtn').addEventListener('click',()=>setScan(!SCAN.on));
 $('lock').addEventListener('click',()=>{
   if(LOCK.on){dropLock('you dropped it');return;}
   /* no tap target: fall back to whatever the motion detector last flagged */
@@ -1815,6 +1920,180 @@ $('lock').addEventListener('click',()=>{
     ? lastMotion : {x:overlay.width/2,y:overlay.height/2};
   startLock(m.x,m.y);
 });
+
+
+/* ============================ scanning for things that changed ============================
+ Everything above only ever asks "what got brighter?" — the motion detector literally
+ tested d>thr on already-bright pixels, so an unlit object could never trip it. Two
+ methods here look for change of either sign.
+
+ DIFFERENCE IMAGING. The sky-aligned stack is a reference image of the static sky. Warp
+ the live frame into the same attitude, subtract, and whatever is left moved: a light
+ shows as a positive residual, a dark shape against skyglow as a negative one. The
+ difference is normalised by its own median first, so a phone auto-exposure step shifts
+ every pixel equally and cancels instead of reading as a whole-sky event.
+
+ OCCULTATION. With the pointing solved to a fraction of a degree the app knows where
+ every catalogue star should be, so it can watch each one's brightness frame by frame.
+ Something unlit crossing the field puts a star out briefly. The test that makes this
+ real rather than noise is differential: cloud, haze, a hand over the lens or an
+ exposure change dim many stars together, while an occultation takes one or two while
+ their neighbours hold steady. Transits run about a second for an airliner at altitude
+ and a few frames for a balloon; a bird up close is one frame and will be missed.
+========================================================================================= */
+function ensureScanCanvas(){
+  if(!SCAN.dcur){
+    SCAN.dcur=document.createElement('canvas');
+    SCAN.dctx=SCAN.dcur.getContext('2d',{willReadFrequently:true});
+    SCAN.dref=document.createElement('canvas');
+    SCAN.rctx=SCAN.dref.getContext('2d',{willReadFrequently:true});
+  }
+  if(SCAN.dcur.width!==GW||SCAN.dcur.height!==GH){
+    SCAN.dcur.width=GW;SCAN.dcur.height=GH;
+    SCAN.dref.width=GW;SCAN.dref.height=GH;
+  }
+}
+/* separable 3-tap box blur, in place */
+function blur3(g){
+  const t=new Float32Array(NPX);
+  for(let y=0;y<GH;y++)for(let x=0;x<GW;x++){
+    const i=y*GW+x,l=x>0?g[i-1]:g[i],r=x<GW-1?g[i+1]:g[i];
+    t[i]=(l+g[i]+r)/3;}
+  for(let y=0;y<GH;y++)for(let x=0;x<GW;x++){
+    const i=y*GW+x,u=y>0?t[i-GW]:t[i],dn=y<GH-1?t[i+GW]:t[i];
+    g[i]=(u+t[i]+dn)/3;}
+}
+function scanDiff(){
+  if(!STACK.on||STACK.n<12||!STACK.ref||!basis)return null;
+  const vw=video.videoWidth,vh=video.videoHeight;
+  if(!vw||!vh)return null;
+  const M=alignAffine();if(!M)return null;
+  ensureScanCanvas();
+  const W=overlay.width,H=overlay.height,sx=GW/W,sy=GH/H;
+  SCAN.dctx.setTransform(1,0,0,1,0,0);SCAN.dctx.clearRect(0,0,GW,GH);
+  SCAN.dctx.setTransform(sx*M.a,sy*M.b,sx*M.c,sy*M.d,sx*M.e,sy*M.f);
+  drawCameraFrame(SCAN.dctx,W,H);
+  SCAN.dctx.setTransform(1,0,0,1,0,0);
+  SCAN.rctx.clearRect(0,0,GW,GH);
+  SCAN.rctx.drawImage(STACK.acc,0,0,W,H,0,0,GW,GH);
+  const a=SCAN.dctx.getImageData(0,0,GW,GH).data;
+  const b=SCAN.rctx.getImageData(0,0,GW,GH).data;
+  const ga=new Float32Array(NPX),gb=new Float32Array(NPX);
+  for(let i=0,p=0;i<NPX;i++,p+=4){
+    ga[i]=a[p]*0.299+a[p+1]*0.587+a[p+2]*0.114;
+    gb[i]=b[p]*0.299+b[p+1]*0.587+b[p+2]*0.114;}
+  /* Blur both to a common resolution before subtracting. The stacked reference is
+     slightly softened by the sub-pixel jitter it averaged over while the live frame is
+     sharp, so without this every star leaves a bright residual and drowns the real
+     detections. This is the cheap end of PSF matching. */
+  blur3(ga);blur3(gb);
+  const d=new Float32Array(NPX);
+  for(let i=0;i<NPX;i++)d[i]=ga[i]-gb[i];
+  /* median and MAD: a robust zero point and scale, so a global exposure shift cancels
+     and a handful of real outliers cannot inflate the threshold that would find them */
+  const samp=[];for(let i=0;i<NPX;i+=7)samp.push(d[i]);
+  samp.sort((x,y)=>x-y);
+  const med=samp[samp.length>>1];
+  const dev=samp.map(x=>Math.abs(x-med));dev.sort((x,y)=>x-y);
+  const mad=Math.max(1.2,dev[dev.length>>1]*1.4826);
+  SCAN.noise=mad;
+  const thr=Math.max(4*mad,10);
+  /* Known stars are masked out: whatever residual they leave is registration, not a
+     new object, and the app knows exactly where they are. */
+  const mask=[];
+  for(const st of starsUp){
+    if(st.el<=0||st.mag>4.5)continue;
+    const p=project(st.az,st.el);if(!p)continue;
+    mask.push(screenToProc(p.x,p.y));
+  }
+  const out=[];
+  for(let y=4;y<GH-4;y++)for(let x=4;x<GW-4;x++){
+    const v=d[y*GW+x]-med,av=Math.abs(v);
+    if(av<thr)continue;
+    let masked=false;
+    for(const m of mask)if(Math.abs(m.x-x)<3&&Math.abs(m.y-y)<3){masked=true;break;}
+    if(masked)continue;
+    if(av<Math.abs(d[y*GW+x-1]-med)||av<Math.abs(d[y*GW+x+1]-med)||
+       av<Math.abs(d[(y-1)*GW+x]-med)||av<Math.abs(d[(y+1)*GW+x]-med))continue;
+    let hit=null;
+    for(const o of out)if(Math.abs(o.x-x)<4&&Math.abs(o.y-y)<4){hit=o;break;}
+    if(hit){if(av>Math.abs(hit.v)){hit.x=x;hit.y=y;hit.v=v;}}
+    else out.push({x,y,v});
+  }
+  return out.sort((p,q)=>Math.abs(q.v)-Math.abs(p.v)).slice(0,8);
+}
+/* a single frame proves nothing; require the same thing in the same place repeatedly */
+function mergeEvents(blobs){
+  const now=Date.now();
+  (blobs||[]).forEach(b=>{
+    const sc=procToScreen(b.x,b.y);
+    const q=basis?unproject(sc.x,sc.y):null;
+    if(!q)return;
+    const sign=b.v<0?-1:1;
+    let m=null;
+    for(const e of SCAN.events)
+      if(e.sign===sign&&angSepDeg(e.az,e.el,q.az,q.el)<2.5){m=e;break;}
+    if(m){m.az=q.az;m.el=q.el;m.v=b.v;m.last=now;m.n++;}
+    else SCAN.events.push({az:q.az,el:q.el,v:b.v,sign,first:now,last:now,n:1});
+  });
+  SCAN.events=SCAN.events.filter(e=>now-e.last<3000);
+}
+const scanConfirmed=()=>SCAN.events.filter(e=>e.n>=3);
+function scanOccult(gray){
+  if(!basis||!starsUp.length)return;
+  const now=Date.now(),seen=[];
+  for(const st of starsUp){
+    if(st.el<=0||st.mag>3.9)continue;
+    const p=project(st.az,st.el);if(!p)continue;
+    const q=screenToProc(p.x,p.y);
+    const bl=findBlob(gray,q.x,q.y,3,1,0);
+    const flux=bl?Math.max(0,bl.contrast):0;
+    let rec=SCAN.base.get(st.name);
+    if(!rec){rec={ema:flux,dip:0,t0:0};SCAN.base.set(st.name,rec);}
+    seen.push({st,flux,rec});
+  }
+  SCAN.nStars=seen.length;
+  if(seen.length<4)return;
+  seen.forEach(o=>{o.dip=o.rec.ema>6&&o.flux<0.45*o.rec.ema;});
+  const nDip=seen.filter(o=>o.dip).length;
+  /* many stars dimming at once is weather or exposure, never a discrete object */
+  SCAN.globalDim=nDip/seen.length>0.3;
+  seen.forEach(o=>{
+    if(o.dip&&!SCAN.globalDim){
+      if(!o.rec.dip){o.rec.dip=1;o.rec.t0=now;}
+      return;                                  // baseline frozen so it cannot chase the dip
+    }
+    if(o.rec.dip){
+      const ms=now-o.rec.t0;
+      if(ms>=120&&ms<8000){
+        SCAN.occ.push({name:o.st.name,az:o.st.az,el:o.st.el,ms,
+          depth:1-o.flux/Math.max(1,o.rec.ema),t:now,others:seen.length});
+        if(SCAN.occ.length>12)SCAN.occ.shift();
+      }
+      o.rec.dip=0;
+    }
+    o.rec.ema=o.rec.ema*0.96+o.flux*0.04;
+  });
+}
+function runScan(gray){
+  if(!SCAN.on||!running)return;
+  const now=Date.now();
+  if(now-SCAN.last<100)return;                 // ~10 Hz is plenty and saves battery
+  SCAN.last=now;
+  mergeEvents(scanDiff());
+  scanOccult(gray);
+}
+function setScan(on){
+  SCAN.on=on;
+  $('scanBtn').dataset.on=on?'1':'0';
+  if(on){
+    SCAN.events=[];SCAN.occ=[];SCAN.base.clear();
+    setStatus('Scanning for change of either sign — a light, or something unlit crossing '+
+      (STACK.on?'the stack':'the sky')+'. Turn Stack on as well: difference imaging needs '+
+      'the aligned reference frame it builds.','ok');
+  }else setStatus('Scan off.','');
+  renderSheet();
+}
 
 /* ============================ render + detection loop ============================ */
 /* The overlay runs on its own: the sky map still works when the camera is
@@ -1831,14 +2110,17 @@ function sizeProc(){
   const h=W>=H?Math.max(1,Math.round(L*H/W)):L;
   if(w!==GW||h!==GH){proc.width=GW=w;proc.height=GH=h;NPX=GW*GH;prev=null;}
 }
-function grabFrame(){                       // cover-crop the video into proc
+/* The one place the camera's visible region is defined. The detector, the stack and
+   the difference imager all draw through this, so they cannot disagree about framing.
+   Target aspect matches the display, so the crop is the same at any output size. */
+function drawCameraFrame(ctx,W,H){
   const vw=video.videoWidth,vh=video.videoHeight;
   if(!vw||!vh)return false;
-  const s=Math.max(overlay.width/vw,overlay.height/vh);
-  const cw=overlay.width/s,ch=overlay.height/s;
-  pctx.drawImage(video,(vw-cw)/2,(vh-ch)/2,cw,ch,0,0,GW,GH);
+  const k=Math.max(W/vw,H/vh),cw=W/k,ch=H/k;
+  ctx.drawImage(video,(vw-cw)/2,(vh-ch)/2,cw,ch,0,0,W,H);
   return true;
 }
+function grabFrame(){return drawCameraFrame(pctx,GW,GH);}
 const procToScreen=(x,y)=>({x:x/GW*overlay.width, y:y/GH*overlay.height});
 const screenToProc=(x,y)=>({x:x/overlay.width*GW, y:y/overlay.height*GH});
 let rafOn=false;
@@ -1852,7 +2134,7 @@ function loop(){
       for(let i=0,p=0;i<NPX;i++,p+=4)gray[i]=rgb[p]*0.299+rgb[p+1]*0.587+rgb[p+2]*0.114;
     }
   }
-  if(gray)trackLock(gray,rgb);
+  if(gray){trackLock(gray,rgb);runScan(gray);}
   stackFrame();
   drawOverlay();
   if(gray&&prev){
@@ -1984,6 +2266,30 @@ function renderSheet(){
       `<span class="v">az ${Math.round(s.az)}° · el ${Math.round(s.el)}° · m${s.mag.toFixed(1)}</span></div>`).join('');
     const nStars=starsUp.filter(s=>s.el>0&&s.mag<=lim).length;
     html+=`<div class="hint" style="padding:.25rem 0">★ ${nStars} stars ≤ m${lim.toFixed(1)} up · ${dsoUp.length} deep-sky up</div>`;
+    /* scan results sit above the routine sky list — they are the reason to look */
+    if(SCAN.on){
+      const conf=scanConfirmed();
+      html+='<div class="hint" style="padding:.35rem 0 .1rem">scan · noise ±'+
+        SCAN.noise.toFixed(1)+' · '+SCAN.nStars+' stars watched'+
+        (SCAN.globalDim?' · <span style="color:var(--warn)">whole sky dimming (cloud or exposure) — occultation suppressed</span>':'')+
+        (STACK.on?'':' · <span style="color:var(--warn)">turn Stack on for difference imaging</span>')+'</div>';
+      if(!conf.length&&!SCAN.occ.length)
+        html+='<div class="obj"><span class="nm">no change detected</span><span class="v">—</span></div>';
+      conf.forEach(e=>{
+        const dark=e.sign<0;
+        html+='<div class="obj"><span class="nm"><span class="dot" style="background:'+
+          (dark?'var(--dso)':'var(--planet)')+'"></span>'+
+          (dark?'dark shape':'unexplained light')+'</span>'+
+          '<span class="v">az '+Math.round(e.az)+'° · el '+Math.round(e.el)+'° · '+
+          e.n+' frames · '+Math.abs(e.v).toFixed(0)+' contrast</span></div>';
+      });
+      SCAN.occ.slice(-4).reverse().forEach(o=>{
+        html+='<div class="obj"><span class="nm"><span class="dot" style="background:var(--rad)"></span>'+
+          o.name+' occulted</span><span class="v">'+Math.round(o.ms)+'ms · '+
+          Math.round(o.depth*100)+'% deep · '+o.others+' stars steady</span></div>';
+      });
+    }
+
     /* active radiants */
     if(radUp.length)html+=radUp.map(r=>
       `<div class="obj"><span class="nm"><span class="dot" style="background:var(--rad)"></span>${r.name} radiant</span>`+
@@ -2020,6 +2326,7 @@ function lockPanel(){
   const title=v.kind==='match'?'MATCH · '+v.best.name
             :v.kind==='conflict'?'NEAREST OBJECT DISAGREES'
             :v.kind==='insufficient'?'CANNOT ADJUDICATE'
+            :v.kind==='near'?'NEAR THE LENS — NOT IN THE SKY'
             :'NO CATALOGUE MATCH';
   let h='<div class="verdict" style="border-left-color:'+head+'">'+
         '<span class="ttl" style="color:'+head+'">'+title+'</span>'+
@@ -2031,6 +2338,9 @@ function lockPanel(){
      st.span.toFixed(1)+'s · scatter '+st.scatter.toFixed(2)+'°</span></div>';
   h+='<div class="obj"><span class="nm">pointing</span><span class="v">'+v.Q.aim+
      ' · gate ±'+v.Q.gate.toFixed(2)+'°</span></div>';
+  if(v.psf)h+='<div class="obj"><span class="nm">blur vs stars</span><span class="v">'+
+     v.psf.ratio.toFixed(2)+'× ('+v.psf.nStars+' stars)'+
+     (v.psf.ratio>=1.6?' — resolved, near the lens':' — point source')+'</span></div>';
   if(ph)h+='<div class="obj"><span class="nm"><span class="dot" style="background:rgb('+
      ph.r+','+ph.g+','+ph.b+')"></span>light</span><span class="v">'+
      Math.round(ph.mean)+' over sky · var '+(ph.cv*100).toFixed(0)+'%'+
