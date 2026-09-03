@@ -7,10 +7,21 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/satellite.js/5.0.0/satellite.min.js"></script>
 <style>
   :root{
-    --bg:#080b11;--panel:#0d1219;--ink:#c3ccc4;--dim:#6a7770;--line:#1c2732;
+    --bg:#080b11;--panel:#0e141d;--ink:#ccd6cf;--dim:#71807a;--line:#1f2b38;
     --air:#5fd3bc;--sat:#8ab4ff;--sun:#ffd27f;--moon:#cfd6dd;--planet:#ffb347;
     --star:#e3ebf2;--dso:#b78bff;--rad:#7fe57f;
     --hit:#ff6b6b;--lock:#5fd3bc;--alert:#ff6b6b;
+    --ok:#5fd3bc;--warn:#ffb347;--bad:#ff6b6b;--line2:rgba(31,43,56,.55);
+  }
+  /* Night vision. Dark adaptation takes twenty minutes to build and one glance at a
+     white screen to lose, so the whole instrument — controls and drawn sky alike —
+     drops to red. The overlay reads these same tokens, so it turns red too. */
+  html[data-night="1"]{
+    --bg:#080000;--panel:#180606;--ink:#ff7a58;--dim:#9c3e2e;--line:#421410;
+    --air:#ff6a45;--sat:#ff8158;--sun:#ff9b6a;--moon:#ff8a63;--planet:#ff7a45;
+    --star:#ff9673;--dso:#ff7052;--rad:#ff8055;
+    --hit:#ff3b2f;--lock:#ff9060;--alert:#ff3b2f;
+    --ok:#ff9060;--warn:#ff7a3c;--bad:#ff3b2f;--line2:rgba(66,20,16,.65);
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
@@ -24,55 +35,99 @@
 
   header{position:absolute;top:0;left:0;right:0;z-index:5;pointer-events:none;
     display:flex;align-items:baseline;gap:.5rem;padding:.5rem .7rem;
-    background:linear-gradient(180deg,rgba(8,11,17,.85),rgba(8,11,17,0))}
-  header h1{margin:0;font-size:.8rem;letter-spacing:.3em;font-weight:600}
-  header .sub{font-size:.54rem;letter-spacing:.15em;color:var(--dim);text-transform:uppercase}
+    background:linear-gradient(180deg,rgba(0,0,0,.8),transparent)}
+  header h1{margin:0;font-size:.82rem;letter-spacing:.3em;font-weight:600;flex:none}
+  header .sub{font-size:.54rem;letter-spacing:.15em;color:var(--dim);text-transform:uppercase;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+  @media (max-width:430px){header .sub{display:none}}
 
   #hud{position:absolute;top:.5rem;right:.7rem;z-index:5;text-align:right;
-    font-size:.6rem;line-height:1.5;color:var(--dim);text-shadow:0 0 5px #000;pointer-events:none}
+    font-size:.66rem;line-height:1.5;color:var(--dim);text-shadow:0 0 5px #000;pointer-events:none}
   #hud b{color:var(--ink);font-variant-numeric:tabular-nums;letter-spacing:.03em}
+  /* the readiness chips carry these now; repeating them over the sky is just clutter */
+  #hud .dup{display:none}
 
   #dock{position:absolute;left:0;right:0;bottom:0;z-index:6;
-    background:linear-gradient(0deg,rgba(8,11,17,.95),rgba(8,11,17,.55) 75%,transparent);
-    padding:.55rem .7rem calc(.55rem + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:.5rem;
+    background:linear-gradient(0deg,rgba(0,0,0,.94),rgba(0,0,0,.62) 78%,transparent);
+    padding:.45rem .7rem calc(.45rem + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:.38rem;
     max-height:72vh;overflow-y:auto;-webkit-overflow-scrolling:touch}
   .btnrow{display:flex;gap:.4rem;flex-wrap:wrap}
-  button{font:inherit;font-size:.6rem;letter-spacing:.08em;text-transform:uppercase;
+  /* 2.9rem floor keeps every control a real touch target: this is used outdoors,
+     in the dark, one-handed, often with cold fingers. */
+  button{font:inherit;font-size:.66rem;letter-spacing:.06em;text-transform:uppercase;
     background:var(--panel);color:var(--ink);border:1px solid var(--line);
-    border-radius:.5rem;padding:.6rem .55rem;cursor:pointer;flex:1 1 auto}
+    border-radius:.55rem;padding:.65rem .5rem;min-height:2.9rem;cursor:pointer;flex:1 1 auto;
+    transition:border-color .15s ease,color .15s ease}
   button.primary{border-color:var(--lock);color:var(--lock)}
-  button:disabled{opacity:.4}
-  button.tog{padding:.42rem .4rem;color:var(--dim)}
+  button:disabled{opacity:.35}
+  button.tog{color:var(--dim)}
   button.tog[data-on="1"]{color:var(--star);border-color:var(--star)}
+  /* the one control the app is waiting on */
+  button.next:not(:disabled){border-color:var(--lock);color:var(--lock);
+    box-shadow:inset 0 0 0 1px var(--lock)}
+  @media (prefers-reduced-motion:no-preference){
+    button.next:not(:disabled){animation:breathe 2.4s ease-in-out infinite}
+  }
+  @keyframes breathe{0%,100%{opacity:1}50%{opacity:.66}}
+
+  .group{display:flex;flex-direction:column;gap:.28rem}
+  .group .lbl{font-size:.5rem;letter-spacing:.18em;text-transform:uppercase;color:var(--dim)}
+  .group.done{display:none}
+  /* numbering only earns its place while there are two steps to tell apart */
+  body.ready .group .lbl{display:none}
+  .modes button{min-height:2rem;padding:.35rem .5rem;font-size:.56rem}
+
+  /* instrument readiness, always visible: the most important state in the app was
+     previously the smallest, dimmest text, folded away behind Setup */
+  #chips{display:flex;gap:.28rem;flex-wrap:wrap;align-items:center}
+  #chips{gap:.24rem}
+  .chip{display:inline-flex;align-items:center;gap:.26rem;font-size:.52rem;letter-spacing:.06em;
+    text-transform:uppercase;color:var(--dim);background:var(--panel);
+    border:1px solid var(--line);border-radius:999px;padding:.22rem .42rem;white-space:nowrap}
+  .chip i{width:.42rem;height:.42rem;border-radius:50%;background:var(--dim);flex:none}
+  .chip.ok{color:var(--ok)} .chip.ok i{background:var(--ok)}
+  .chip.warn{color:var(--warn)} .chip.warn i{background:var(--warn)}
+  .chip.bad{color:var(--bad)} .chip.bad i{background:var(--bad)}
+  #guide{font-size:.63rem;line-height:1.4;color:var(--ink);display:flex;gap:.4rem;align-items:baseline}
+  #guide .arrow{color:var(--lock);flex:none}
+  #guide b{color:var(--lock);font-weight:600}
   .sliders{display:flex;flex-direction:column;gap:.3rem}
-  .slide{display:flex;align-items:center;gap:.5rem;font-size:.54rem;color:var(--dim);
+  .slide{display:flex;align-items:center;gap:.5rem;font-size:.58rem;color:var(--dim);
     text-transform:uppercase;letter-spacing:.09em}
-  .slide label{width:5.6rem;flex:none}
-  .slide output{width:2.6rem;text-align:right;color:var(--ink);font-variant-numeric:tabular-nums}
-  input[type=range]{flex:1;accent-color:var(--planet)}
-  input[type=text]{flex:1;background:#0a0f16;border:1px solid var(--line);color:var(--ink);
-    font:inherit;font-size:.56rem;border-radius:.4rem;padding:.4rem .5rem}
-  #status{font-size:.58rem;color:var(--dim);line-height:1.4;min-height:1.3em}
+  .slide label{width:6rem;flex:none}
+  .slide output{width:2.8rem;text-align:right;color:var(--ink);font-variant-numeric:tabular-nums}
+  input[type=range]{flex:1;accent-color:var(--planet);height:1.7rem}
+  input[type=text]{flex:1;background:var(--panel);border:1px solid var(--line);color:var(--ink);
+    font:inherit;font-size:.6rem;border-radius:.4rem;padding:.55rem .5rem}
+  /* no message, no reserved space — the guide line above already says what to do */
+  #status{font-size:.62rem;color:var(--dim);line-height:1.45}
+  #status:empty{display:none}
   #status.err{color:var(--alert)}#status.ok{color:var(--lock)}
 
   #tabs{display:flex;gap:.3rem}
-  .tab{flex:1;text-align:center;font-size:.55rem;padding:.4rem;border:1px solid var(--line);
-    border-radius:.4rem;color:var(--dim);text-transform:uppercase;letter-spacing:.1em}
+  .tab{flex:1;text-align:center;font-size:.6rem;padding:.62rem .3rem;border:1px solid var(--line);
+    border-radius:.45rem;color:var(--dim);text-transform:uppercase;letter-spacing:.1em;
+    cursor:pointer;user-select:none}
   .tab[aria-selected="true"]{color:var(--ink);border-color:var(--lock)}
-  #sheet{max-height:30vh;overflow-y:auto;font-size:.58rem;line-height:1.55;display:none}
+  #sheet{max-height:30vh;overflow-y:auto;font-size:.63rem;line-height:1.55;display:none}
   #sheet.open{display:block}
   /* Advanced controls stay folded away: this is a camera app, and the sky is the point. */
   #setup{display:none;flex-direction:column;gap:.5rem}
   #setup.open{display:flex}
   .caret{flex:0 0 auto;width:2.1rem;padding:.35rem;font-size:.75rem;line-height:1;
-    color:var(--dim);transition:transform .15s ease}
+    min-height:2.4rem;color:var(--dim);transition:transform .15s ease}
   .caret[aria-expanded="false"]{transform:rotate(-90deg)}
-  .obj{display:flex;justify-content:space-between;gap:.5rem;padding:.15rem 0;border-bottom:1px solid rgba(28,39,50,.5)}
+  .obj{display:flex;justify-content:space-between;gap:.5rem;padding:.22rem 0;border-bottom:1px solid var(--line2)}
   .obj .nm{color:var(--ink)} .obj .v{color:var(--dim);font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
   .dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;margin-right:.35rem;vertical-align:middle}
+  /* the verdict is the answer the whole app exists to give — let it read like one */
+  .verdict{border-left:3px solid var(--dim);padding:.4rem .55rem;margin:.1rem 0 .4rem;
+    background:rgba(255,255,255,.035);border-radius:.35rem}
+  .verdict .ttl{font-size:.74rem;letter-spacing:.06em;font-weight:600;display:block}
+  .verdict .sub{font-size:.58rem;color:var(--dim);font-variant-numeric:tabular-nums}
   #shot{position:absolute;z-index:7;left:.7rem;bottom:9rem;width:34vw;max-width:150px;border:1px solid var(--line);
     border-radius:.4rem;display:none}
-  .hint{font-size:.5rem;color:var(--dim);letter-spacing:.08em}
+  .hint{font-size:.56rem;color:var(--dim);letter-spacing:.06em;line-height:1.5}
   @media (prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
 </style>
 </head>
@@ -84,21 +139,23 @@
   <canvas id="proc" width="256" height="192"></canvas>
 </div>
 
-<header><h1>SKYWATCH</h1><span class="sub">unified v2.1 · full sky over pixels</span></header>
+<header><h1>SKYWATCH</h1><span class="sub">unified v2.1</span></header>
 
 <div id="hud">
   <div>BRG <b id="hBrg">—</b></div>
   <div>ELV <b id="hElv">—</b></div>
   <div>FOV <b id="hFov">68°</b></div>
-  <div>GPS <b id="hGps">—</b></div>
-  <div>AIR <b id="hAir">0</b> · SAT <b id="hSat">0</b></div>
-  <div>STR <b id="hStr">0</b> · HITS <b id="hHit">0</b></div>
+  <div class="dup">GPS <b id="hGps">—</b></div>
+  <div class="dup">AIR <b id="hAir">0</b> · SAT <b id="hSat">0</b></div>
+  <div class="dup">STR <b id="hStr">0</b> · HITS <b id="hHit">0</b></div>
 </div>
 
 <img id="shot" alt="last capture">
 
 <div id="dock">
-  <div id="status">Grant location + camera, wave a figure-8 to calibrate the compass, then point at open sky.</div>
+  <div id="chips"></div>
+  <div id="guide"></div>
+  <div id="status"></div>
 
   <div id="tabs">
     <div class="tab" id="tabSky" aria-selected="true">Sky now</div>
@@ -132,14 +189,29 @@
   <div id="diag" class="hint">GPS — · CMP — · AIR — · SAT — · STR emb · secure —</div>
   </div>
 
-  <div class="btnrow">
-    <button id="geo" class="primary">Location</button>
-    <button id="start" class="primary">Camera</button>
-    <button id="sensors">Compass</button>
-    <button id="lock" disabled>Lock</button>
-    <button id="capture" disabled>Shot</button>
-    <button id="solve" disabled>Solve</button>
-    <button class="tog" id="stackBtn" data-on="0" disabled>Stack</button>
+  <!-- Grouped by the order the instrument is actually used, and the first group
+       hides itself once all three are granted. -->
+  <div class="group" id="readyGroup">
+    <div class="lbl">1 · get ready</div>
+    <div class="btnrow">
+      <button id="geo" class="primary">Location</button>
+      <button id="sensors">Compass</button>
+      <button id="start" class="primary">Camera</button>
+    </div>
+  </div>
+
+  <div class="group">
+    <div class="lbl">2 · observe</div>
+    <div class="btnrow">
+      <button class="tog" id="stackBtn" data-on="0" disabled>Stack</button>
+      <button id="solve" disabled>Solve</button>
+      <button id="lock" disabled>Lock</button>
+      <button id="capture" disabled>Shot</button>
+    </div>
+  </div>
+
+  <div class="btnrow modes">
+    <button class="tog" id="nightBtn" data-on="0">Night vision</button>
     <button class="tog" id="setupToggle" data-on="0">Setup</button>
   </div>
 </div>
@@ -615,6 +687,8 @@ const solveAgeS=()=>SOLVE.R?(Date.now()-SOLVE.t)/1000:null;
 const solveLive=()=>!!SOLVE.R&&(Date.now()-SOLVE.t)<SOLVE_TTL*1000;
 const STACK={on:false,n:0,ref:null,fov:null,acc:null,actx:null,ctx:null,
              drift:6,lastPaint:0};
+const LOCK={on:false,samples:[],rad:14,started:0,verdict:null,lastCalc:0,
+            lastSeen:0,seed:{x:0,y:0}};
 let aircraft=[], satrecs=[], knowns=[];   // knowns: {name,az,el,color,kind}
 let starsUp=[], dsoUp=[], radUp=[];       // fixed-sky layers, refreshed with knowns
 let lastCapture=null;
@@ -669,6 +743,8 @@ function setSetupOpen(o){
 }
 $('sheetToggle').addEventListener('click',()=>setSheetOpen(!$('sheet').classList.contains('open')));
 $('setupToggle').addEventListener('click',()=>setSetupOpen(!$('setup').classList.contains('open')));
+$('nightBtn').addEventListener('click',()=>
+  setNight(document.documentElement.getAttribute('data-night')!=='1'));
 
 /* Tapping a tab means you want to read it, so it also opens a collapsed sheet.
    Switching tabs from code (a new lock) does not — it must never cover the sky
@@ -681,8 +757,57 @@ function switchTab(t){tab=t;$('tabSky').setAttribute('aria-selected',t==='sky');
   $('tabAn').setAttribute('aria-selected',t==='an');
   $('tabLock').setAttribute('aria-selected',t==='lock');renderSheet();}
 
-setSheetOpen(recall('sw.sheet',true));
-setSetupOpen(recall('sw.setup',false));
+
+/* ============================ readiness and guidance ============================
+ The app has a required order — locate, orient, see, sharpen, then identify — but
+ used to present eight equal buttons and expect you to know. These two rows say what
+ the instrument's state is and what to press next, which matters most at 2am in a
+ field when you have not opened it for a month.
+=============================================================================== */
+function chipHtml(label,state){
+  return '<span class="chip '+state+'"><i></i>'+label+'</span>';
+}
+function renderChips(){
+  const c=[];
+  c.push(chipHtml('GPS', me?'ok':'bad'));
+  c.push(chipHtml('CMP', diag.compass==='ok'?'ok':diag.compass==='rel'?'warn':'bad'));
+  c.push(chipHtml('CAM', running?'ok':'bad'));
+  c.push(chipHtml(solveLive()?'AIM ±'+SOLVE.rms.toFixed(2)+'°':'AIM raw',
+                  solveLive()?'ok':'warn'));
+  c.push(chipHtml(/rx/.test(diag.air)?'AIR '+aircraft.length:'AIR none',
+                  /rx/.test(diag.air)?'ok':'warn'));
+  c.push(chipHtml(engineReady?'SAT '+Math.round(SATENGINE.stats().visible/100)/10+'k':'SAT …',
+                  engineReady?'ok':'warn'));
+  if(STACK.on)c.push(chipHtml('STACK '+STACK.n,'ok'));
+  $('chips').innerHTML=c.join('');
+}
+function nextStep(){
+  if(!me)          return{el:'geo',    t:'Tap <b>Location</b> to fix where you are'};
+  if(!basis)       return{el:'sensors',t:'Turn the <b>Compass</b> on so the overlay knows where you point'};
+  if(!running)     return{el:'start',  t:'Start the <b>Camera</b>'};
+  if(LOCK.on)      return{el:null,     t:'Locked — hold the light near the reticle while the track builds'};
+  if(!STACK.on&&!solveLive())
+                   return{el:'stackBtn',t:'Point at open sky, then <b>Stack</b> to pull faint stars out'};
+  if(!solveLive()) return{el:'solve',  t:'<b>Solve</b> to fix the aim on the star field — until then the compass is 5-15° out'};
+  return{el:null,  t:'Ready — <b>tap any light</b> in the view to identify it'};
+}
+const GUIDED=['geo','sensors','start','stackBtn','solve'];
+function renderGuide(){
+  const n=nextStep();
+  $('guide').innerHTML='<span class="arrow">▸</span><span>'+n.t+'</span>';
+  GUIDED.forEach(id=>$(id).classList.toggle('next',n.el===id));
+  const ready=!!(me&&basis&&running);
+  $('readyGroup').classList.toggle('done',ready);
+  document.body.classList.toggle('ready',ready);
+}
+function renderBar(){renderChips();renderGuide();}
+function setNight(on){
+  document.documentElement.setAttribute('data-night',on?'1':'0');
+  $('nightBtn').dataset.on=on?'1':'0';
+  for(const k in _colCache)delete _colCache[k];   // overlay colours are memoised
+  renderSheet();                                 // list dots are baked into its HTML
+  remember('sw.night',on);
+}
 
 /* ============================ diagnostics ============================ */
 const diag={gps:'—',compass:'—',air:'—',sat:'—',str:STARS.length+' emb'};
@@ -692,6 +817,7 @@ function renderDiag(){
   const aim=solveLive()
     ? `SOLVED ±${SOLVE.rms.toFixed(2)}° (${SOLVE.nStars} stars, ${Math.round(solveAgeS())}s)`
     : SOLVE.fail?`unsolved (${SOLVE.fail})`:'compass only';
+  renderBar();
   $('diag').innerHTML=`GPS ${diag.gps} · CMP ${diag.compass} · AIM ${aim} · AIR ${diag.air} · SAT ${diag.sat} · STR ${diag.str} · secure ${sec}${framed}`;
 }
 renderDiag();
@@ -1018,7 +1144,7 @@ function drawOverlay(){
   /* constellation lines (drawn under everything) */
   if(on('lines')){
     const pos={};starsUp.forEach(s=>{if(s.named)pos[s.name]=s;});
-    octx.strokeStyle='rgba(138,180,255,.22)';octx.lineWidth=1;
+    octx.strokeStyle=pal('sat',.22);octx.lineWidth=1;
     LINES.forEach(chain=>{
       let prevP=null;
       chain.forEach(nm=>{
@@ -1030,21 +1156,21 @@ function drawOverlay(){
 
   /* stars */
   if(on('stars')){
-    octx.fillStyle='#e3ebf2';
+    octx.fillStyle=pal('star');
     starsUp.forEach(s=>{
       if(s.mag>lim)return;
       const p=project(s.az,s.el);if(!p)return;
       const r=s.mag<0.5?3.4:s.mag<1.5?2.7:s.mag<2.5?2.1:s.mag<3.5?1.6:1.1;
       octx.beginPath();octx.arc(p.x,p.y,r,0,7);octx.fill();
       if(s.mag<=1.6||s.name==='Polaris'){
-        octx.font='9px ui-monospace';octx.fillStyle='rgba(227,235,242,.75)';
-        octx.fillText(s.name,p.x+6,p.y-4);octx.fillStyle='#e3ebf2';}
+        octx.font='9px ui-monospace';octx.fillStyle=pal('star',.75);
+        octx.fillText(s.name,p.x+6,p.y-4);octx.fillStyle=pal('star');}
     });
   }
 
   /* deep sky */
   if(on('deep')){
-    octx.strokeStyle='rgba(183,139,255,.8)';octx.fillStyle='rgba(183,139,255,.9)';octx.lineWidth=1;
+    octx.strokeStyle=pal('dso',.8);octx.fillStyle=pal('dso',.9);octx.lineWidth=1;
     dsoUp.forEach(o=>{const p=project(o.az,o.el);if(!p)return;
       octx.strokeRect(p.x-4,p.y-4,8,8);
       octx.font='9px ui-monospace';octx.fillText(o.name,p.x+7,p.y+3);});
@@ -1052,7 +1178,7 @@ function drawOverlay(){
 
   /* meteor radiants — diamond marker */
   if(on('rad')){
-    octx.strokeStyle='rgba(127,229,127,.85)';octx.fillStyle='rgba(127,229,127,.9)';octx.lineWidth=1.5;
+    octx.strokeStyle=pal('rad',.85);octx.fillStyle=pal('rad',.9);octx.lineWidth=1.5;
     radUp.forEach(rp=>{if(!rp.up)return;const p=project(rp.az,rp.el);if(!p)return;
       octx.beginPath();octx.moveTo(p.x,p.y-8);octx.lineTo(p.x+8,p.y);octx.lineTo(p.x,p.y+8);octx.lineTo(p.x-8,p.y);octx.closePath();octx.stroke();
       octx.font='9px ui-monospace';octx.fillText(rp.name+' radiant',p.x+10,p.y+3);});
@@ -1070,7 +1196,7 @@ function drawOverlay(){
       if(isJunk){
         if(!on('debris'))return;
         const p=project(azD,elD);if(!p)return;
-        octx.fillStyle='rgba(120,130,145,.45)';
+        octx.fillStyle=pal('dim',.6);
         octx.beginPath();octx.arc(p.x,p.y,1.3,0,7);octx.fill();
         return;
       }
@@ -1079,11 +1205,11 @@ function drawOverlay(){
         octx.fillStyle=satCol;
         octx.beginPath();octx.arc(p.x,p.y,2.6,0,7);octx.fill();
         if(labels<16){
-          octx.font='9px ui-monospace';octx.fillStyle='rgba(138,180,255,.8)';
+          octx.font='9px ui-monospace';octx.fillStyle=pal('sat',.8);
           octx.fillText(o.name,p.x+5,p.y-3);labels++;
         }
       }else{
-        octx.fillStyle='rgba(138,180,255,.28)';
+        octx.fillStyle=pal('sat',.28);
         octx.beginPath();octx.arc(p.x,p.y,1.6,0,7);octx.fill();
       }
     });
@@ -1093,7 +1219,7 @@ function drawOverlay(){
      light's real path across the sky rather than the phone's wander */
   if(LOCK.on&&LOCK.samples.length){
     const S=LOCK.samples;
-    octx.strokeStyle='rgba(255,107,107,.45)';octx.lineWidth=1.5;
+    octx.strokeStyle=pal('hit',.45);octx.lineWidth=1.5;
     octx.beginPath();let pen=false;
     for(let i=Math.max(0,S.length-150);i<S.length;i++){
       const sm=S[i];if(sm.az==null){pen=false;continue;}
@@ -1104,7 +1230,7 @@ function drawOverlay(){
     const lastS=S[S.length-1];
     const p=lastS.az!=null?project(lastS.az,lastS.el):null;
     if(p){
-      octx.strokeStyle='#ff6b6b';octx.lineWidth=2;
+      octx.strokeStyle=pal('hit');octx.lineWidth=2;
       octx.strokeRect(p.x-16,p.y-16,32,32);
       octx.beginPath();
       octx.moveTo(p.x-27,p.y);octx.lineTo(p.x-19,p.y);
@@ -1115,7 +1241,7 @@ function drawOverlay(){
       const v=LOCK.verdict;
       if(v){
         octx.font='10px ui-monospace';
-        octx.fillStyle=v.kind==='match'?'#5fd3bc':v.kind==='none'?'#ff6b6b':'#ffb347';
+        octx.fillStyle=v.kind==='match'?pal('lock'):v.kind==='none'?pal('hit'):pal('warn');
         octx.fillText(v.label,p.x+22,p.y-19);
         if(v.st)octx.fillText(v.st.rate.toFixed(2)+'°/s',p.x+22,p.y-7);
       }
@@ -1123,7 +1249,7 @@ function drawOverlay(){
   }
 
   // center reticle
-  octx.strokeStyle='rgba(95,211,188,.25)';octx.lineWidth=1;
+  octx.strokeStyle=pal('lock',.25);octx.lineWidth=1;
   octx.beginPath();octx.moveTo(overlay.width/2-14,overlay.height/2);octx.lineTo(overlay.width/2+14,overlay.height/2);
   octx.moveTo(overlay.width/2,overlay.height/2-14);octx.lineTo(overlay.width/2,overlay.height/2+14);octx.stroke();
   knowns.forEach(o=>{const p=project(o.az,o.el);if(!p)return;
@@ -1436,8 +1562,6 @@ function solveNow(){
 const SIDEREAL=0.00417;          // deg/s — the sky's own drift
 const LOCK_GATE=8;               // deg; phone magnetometers are routinely 5-15 deg out
 let lastGray=null,lastMotion=null;
-const LOCK={on:false,samples:[],rad:14,started:0,verdict:null,lastCalc:0,
-            lastSeen:0,seed:{x:0,y:0}};
 
 function angSepDeg(az1,el1,az2,el2){
   const a1=az1*D2R,e1=el1*D2R,a2=az2*D2R,e2=el2*D2R;
@@ -1738,7 +1862,7 @@ function loop(){
     if(cooldown>0)cooldown--;
     if(best>0&&changed/NPX<0.03){
       const q=procToScreen(bx,by);
-      octx.strokeStyle=changed/NPX<0.006?'#ff6b6b':'#ffb347';octx.lineWidth=2;
+      octx.strokeStyle=changed/NPX<0.006?pal('hit'):pal('warn');octx.lineWidth=2;
       octx.beginPath();octx.arc(q.x,q.y,17,0,7);octx.stroke();
       lastMotion={x:q.x,y:q.y,t:Date.now()};
       if(cooldown===0){hitCount++;$('hHit').textContent=hitCount;cooldown=25;}
@@ -1819,6 +1943,21 @@ const _colCache={};
 function cssColor(v){const k=v.replace('var(','').replace(')','');
   return _colCache[k]||(_colCache[k]=
     (getComputedStyle(document.documentElement).getPropertyValue(k)||'').trim()||'#fff');}
+/* Overlay colours come from the same tokens as the interface, so night vision
+   reaches the drawn sky instead of leaving a red panel under a blue star field. */
+function pal(name,a){
+  const key=name+'|'+(a==null?'':a);
+  if(_colCache[key])return _colCache[key];
+  const c=cssColor('var(--'+name+')');
+  let out=c;
+  if(a!=null){
+    const m=/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(c);
+    if(m){let h=m[1];if(h.length===3)h=h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+      out='rgba('+parseInt(h.slice(0,2),16)+','+parseInt(h.slice(2,4),16)+','+
+          parseInt(h.slice(4,6),16)+','+a+')';}
+  }
+  return(_colCache[key]=out);
+}
 function renderSheet(){
   const b=$('sheetBody');
   if(tab==='sky'){
@@ -1882,9 +2021,10 @@ function lockPanel(){
             :v.kind==='conflict'?'NEAREST OBJECT DISAGREES'
             :v.kind==='insufficient'?'CANNOT ADJUDICATE'
             :'NO CATALOGUE MATCH';
-  let h='<div class="obj"><span class="nm" style="color:'+head+'"><b>'+title+'</b></span>'+
-        '<span class="v">'+st.rate.toFixed(3)+'°/s · '+Math.round(st.bearing)+'° pa</span></div>';
-  h+='<div class="hint" style="padding:.2rem 0">'+v.note+'</div>';
+  let h='<div class="verdict" style="border-left-color:'+head+'">'+
+        '<span class="ttl" style="color:'+head+'">'+title+'</span>'+
+        '<span class="sub">'+st.rate.toFixed(3)+'°/s · position angle '+Math.round(st.bearing)+'°</span>'+
+        '<div class="hint" style="padding:.25rem 0 0">'+v.note+'</div></div>';
   h+='<div class="obj"><span class="nm">position</span><span class="v">az '+
      Math.round(pos.az)+'° · el '+Math.round(pos.el)+'°</span></div>';
   h+='<div class="obj"><span class="nm">track</span><span class="v">'+st.n+' samples · '+
@@ -1941,6 +2081,15 @@ function stats_gen(){
   try{const h=Math.round((Date.now()-new Date(g).getTime())/3600000);
     return ` · TLEs ${h}h old`;}catch(_){return'';}
 }
+
+/* ============================ start up ============================ */
+/* Runs last on purpose: these touch state declared all over the file, and a single
+   temporal-dead-zone throw up here would kill every line after it. */
+setSheetOpen(recall('sw.sheet',true));
+setSetupOpen(recall('sw.setup',false));
+setNight(recall('sw.night',false));
+renderBar();
+setInterval(renderBar,1000);
 
 /* ============================ SATENGINE boot ============================ */
 SATENGINE.init({
