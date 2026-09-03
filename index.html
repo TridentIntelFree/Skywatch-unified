@@ -19,6 +19,8 @@
   video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000}
   #overlay{position:absolute;inset:0;width:100%;height:100%}
   #proc{display:none}
+  #stack{position:absolute;inset:0;width:100%;height:100%;display:none}
+  #stack.on{display:block}
 
   header{position:absolute;top:0;left:0;right:0;z-index:5;pointer-events:none;
     display:flex;align-items:baseline;gap:.5rem;padding:.5rem .7rem;
@@ -77,6 +79,7 @@
 <body>
 <div id="stage">
   <video id="cam" playsinline muted></video>
+  <canvas id="stack"></canvas>
   <canvas id="overlay"></canvas>
   <canvas id="proc" width="256" height="192"></canvas>
 </div>
@@ -135,6 +138,8 @@
     <button id="sensors">Compass</button>
     <button id="lock" disabled>Lock</button>
     <button id="capture" disabled>Shot</button>
+    <button id="solve" disabled>Solve</button>
+    <button class="tog" id="stackBtn" data-on="0" disabled>Stack</button>
     <button class="tog" id="setupToggle" data-on="0">Setup</button>
   </div>
 </div>
@@ -599,9 +604,17 @@ const $=id=>document.getElementById(id);
 const video=$('cam'),overlay=$('overlay'),proc=$('proc'),
       octx=overlay.getContext('2d'),pctx=proc.getContext('2d',{willReadFrequently:true});
 let me=null, heading=null, elevation=null, running=false;
-let basis=null;              // {f,r,u}: camera forward, screen right, screen up — earth [E,N,U]
-let FOV={tx:0.67,ty:1.45};   // tan(half-FOV) per screen axis, refreshed each frame
+let basis=null,rawBasis=null; // {f,r,u}: camera forward, screen right, screen up — earth [E,N,U]
+let FOV={tx:0.67,ty:1.45},RAWFOV={tx:0.67,ty:1.45};  // tan(half-FOV) per screen axis
 let prev=null, hitCount=0, cooldown=0;
+/* Declared here rather than beside their modules: fit() and renderDiag() both run
+   while the script is still evaluating, and would hit the temporal dead zone. */
+const SOLVE_TTL=240;         // s — magnetometer bias drifts, and so does a correction for it
+const SOLVE={R:null,rms:null,nStars:0,scale:1,t:0,fail:null,busy:false};
+const solveAgeS=()=>SOLVE.R?(Date.now()-SOLVE.t)/1000:null;
+const solveLive=()=>!!SOLVE.R&&(Date.now()-SOLVE.t)<SOLVE_TTL*1000;
+const STACK={on:false,n:0,ref:null,fov:null,acc:null,actx:null,ctx:null,
+             drift:6,lastPaint:0};
 let aircraft=[], satrecs=[], knowns=[];   // knowns: {name,az,el,color,kind}
 let starsUp=[], dsoUp=[], radUp=[];       // fixed-sky layers, refreshed with knowns
 let lastCapture=null;
@@ -617,14 +630,19 @@ function engineVisible(){
 
 function setStatus(t,c){const s=$('status');s.textContent=t;s.className=c||'';s.dataset.kind=c||'';}
 const statusIsError=()=>$('status').dataset.kind==='err';
-function fit(){overlay.width=innerWidth;overlay.height=innerHeight;}
+function fit(){overlay.width=innerWidth;overlay.height=innerHeight;
+  if(STACK.acc&&STACK.on)resetStack();}
 addEventListener('resize',fit);fit();
 
 /* sliders */
 ['sens','fov','trim','smag'].forEach(id=>{const el=$(id),o=$('o'+id[0].toUpperCase()+id.slice(1));
   const upd=()=>{o.textContent=id==='sens'?el.value:(id==='smag'?(+el.value).toFixed(1):el.value+'°');
     if(id==='fov')$('hFov').textContent=el.value+'°';
-    if(id==='smag')refreshSky();};
+    if(id==='smag')refreshSky();
+    /* both of these are the very things a solve measures, so a hand adjustment
+       retires the solution rather than silently fighting it */
+    if((id==='trim'||id==='fov')&&(SOLVE.R||SOLVE.fail))clearSolve('you adjusted '+
+      (id==='trim'?'the heading trim':'the field of view'));};
   el.addEventListener('input',upd);upd();});
 
 /* layer toggles */
@@ -671,7 +689,10 @@ const diag={gps:'—',compass:'—',air:'—',sat:'—',str:STARS.length+' emb'}
 function renderDiag(){
   const sec=window.isSecureContext?'yes':'NO';
   const framed=(window.self!==window.top)?' · IFRAME (open in Safari)':'';
-  $('diag').innerHTML=`GPS ${diag.gps} · CMP ${diag.compass} · AIR ${diag.air} · SAT ${diag.sat} · STR ${diag.str} · secure ${sec}${framed}`;
+  const aim=solveLive()
+    ? `SOLVED ±${SOLVE.rms.toFixed(2)}° (${SOLVE.nStars} stars, ${Math.round(solveAgeS())}s)`
+    : SOLVE.fail?`unsolved (${SOLVE.fail})`:'compass only';
+  $('diag').innerHTML=`GPS ${diag.gps} · CMP ${diag.compass} · AIM ${aim} · AIR ${diag.air} · SAT ${diag.sat} · STR ${diag.str} · secure ${sec}${framed}`;
 }
 renderDiag();
 
@@ -761,6 +782,7 @@ $('start').addEventListener('click',async()=>{
     video.srcObject=s;await video.play();running=true;
     $('start').textContent='Live';$('start').disabled=true;
     $('capture').disabled=false;$('lock').disabled=false;
+    $('solve').disabled=false;$('stackBtn').disabled=false;
     setStatus('Live. Full sky overlaid; moving lights flagged. No video is recorded — stills only.','ok');
     startLoop();refreshSky();
   }catch(e){setStatus('Camera blocked: '+e.message+' — needs HTTPS + permission. '+
@@ -792,7 +814,12 @@ function setBasis(alphaDeg,betaDeg,gammaDeg,orientDeg,trimDeg){
   const f=[-dz[0],-dz[1],-dz[2]];                                    // rear camera looks along -z
   const r=[ct*dx[0]-st*dy[0], ct*dx[1]-st*dy[1], ct*dx[2]-st*dy[2]]; // screen right
   const u=[st*dx[0]+ct*dy[0], st*dx[1]+ct*dy[1], st*dx[2]+ct*dy[2]]; // screen up
-  basis={f:rotAz(f,trimDeg),r:rotAz(r,trimDeg),u:rotAz(u,trimDeg)};
+  rawBasis={f:rotAz(f,trimDeg),r:rotAz(r,trimDeg),u:rotAz(u,trimDeg)};
+  /* An astrometric solution replaces the magnetometer as the pointing reference:
+     it is a standing world-frame rotation applied to every subsequent attitude. */
+  basis=solveLive()
+    ? {f:matV(SOLVE.R,rawBasis.f),r:matV(SOLVE.R,rawBasis.r),u:matV(SOLVE.R,rawBasis.u)}
+    : rawBasis;
   heading=rev(Math.atan2(basis.f[0],basis.f[1])*R2D);
   elevation=Math.asin(Math.max(-1,Math.min(1,basis.f[2])))*R2D;
 }
@@ -954,8 +981,11 @@ function updateFov(){
     const L=Math.max(W,H),t=Math.tan(cam/2);
     tx=t*W/L; ty=t*H/L;
   }
-  FOV={tx,ty};
+  RAWFOV={tx,ty};
+  const k=solveLive()?SOLVE.scale:1;      // the solve measures the true focal length
+  FOV={tx:tx*k,ty:ty*k};
 }
+function rawFov(){return RAWFOV;}
 /* gnomonic projection through the live camera basis — exact at any aim, including
    straight up, and it carries roll and landscape for free. */
 function project(az,el){
@@ -1103,6 +1133,296 @@ function drawOverlay(){
     octx.font='10px ui-monospace';octx.fillText(o.name,p.x+11,p.y+3);});
 }
 
+
+
+
+/* ============================ frame stacking for low light ============================
+ A phone sensor in one 1/30 s video frame is shot-noise limited, and most of the sky
+ is below its floor. Averaging N frames drops the noise as sqrt(N) — 16 frames is 4x
+ the signal-to-noise, worth roughly 1.5 magnitudes of depth.
+
+ The hard part of stacking is normally registration. Here it is free: the app already
+ knows the camera's attitude every frame, so each frame is warped into the attitude
+ the stack started at before it is averaged in. Because the stack is aligned on the
+ SKY rather than the screen, stars reinforce while the phone wanders, and anything
+ genuinely moving draws a trail instead of stacking — which is itself diagnostic.
+
+ It feeds back into the pointing solve: more stars visible means more stars to solve
+ on, and a sharper solve means sharper alignment for the next stack.
+==================================================================================== */
+function initStack(){
+  STACK.acc=document.createElement('canvas');
+  STACK.actx=STACK.acc.getContext('2d',{willReadFrequently:true});
+  STACK.ctx=$('stack').getContext('2d');
+}
+function resetStack(){
+  const W=overlay.width,H=overlay.height;
+  STACK.acc.width=W;STACK.acc.height=H;
+  $('stack').width=W;$('stack').height=H;
+  STACK.actx.setTransform(1,0,0,1,0,0);
+  STACK.actx.fillStyle='#000';STACK.actx.fillRect(0,0,W,H);
+  STACK.ctx.setTransform(1,0,0,1,0,0);
+  STACK.ctx.fillStyle='#000';STACK.ctx.fillRect(0,0,W,H);
+  STACK.n=0;STACK.ref=null;
+}
+/* current frame -> the frame the stack started in, as an affine through three corners */
+function alignAffine(){
+  const W=overlay.width,H=overlay.height,out=[];
+  for(const p of [[0,0],[W,0],[0,H]]){
+    const v=pixVec(p[0],p[1],basis,FOV);
+    const d=v3dot(v,STACK.ref.f);
+    if(d<=0.05)return null;
+    const x=v3dot(v,STACK.ref.r)/d/STACK.fov.tx, y=-v3dot(v,STACK.ref.u)/d/STACK.fov.ty;
+    out.push([W/2+x*W/2, H/2+y*H/2]);
+  }
+  const q1=out[0],q2=out[1],q3=out[2];
+  const M={a:(q2[0]-q1[0])/W,b:(q2[1]-q1[1])/W,
+           c:(q3[0]-q1[0])/H,d:(q3[1]-q1[1])/H,e:q1[0],f:q1[1]};
+  return isFinite(M.a+M.b+M.c+M.d+M.e+M.f)?M:null;
+}
+function stackFrame(){
+  if(!STACK.on||!running||!basis)return;
+  const vw=video.videoWidth,vh=video.videoHeight;
+  if(!vw||!vh)return;
+  const W=overlay.width,H=overlay.height;
+  if(STACK.acc.width!==W||STACK.acc.height!==H)resetStack();
+  if(!STACK.ref){
+    STACK.ref={f:basis.f.slice(),r:basis.r.slice(),u:basis.u.slice()};
+    STACK.fov={tx:FOV.tx,ty:FOV.ty};
+  }
+  if(angBetween(basis.f,STACK.ref.f)>STACK.drift){resetStack();return;}
+  const M=alignAffine();
+  if(!M)return;
+  const k=Math.max(W/vw,H/vh),cw=W/k,ch=H/k;
+  STACK.actx.save();
+  STACK.actx.setTransform(M.a,M.b,M.c,M.d,M.e,M.f);
+  STACK.actx.globalAlpha=1/(STACK.n+1);        // running mean, so noise falls as sqrt(n)
+  STACK.actx.drawImage(video,(vw-cw)/2,(vh-ch)/2,cw,ch,0,0,W,H);
+  STACK.actx.restore();
+  STACK.n++;
+  const now=Date.now();
+  if(now-STACK.lastPaint>400){STACK.lastPaint=now;paintStack();}
+}
+/* asinh stretch off an auto black point: lifts the faint end hard while leaving
+   bright stars unclipped, which a linear contrast boost cannot do */
+function paintStack(){
+  const W=overlay.width,H=overlay.height;
+  if(!W||!H)return;
+  const img=STACK.actx.getImageData(0,0,W,H),d=img.data;
+  const hist=new Uint32Array(256);let n=0;
+  for(let i=0;i<d.length;i+=44){hist[(d[i]*77+d[i+1]*150+d[i+2]*29)>>8]++;n++;}
+  let c=0,black=0,white=255;
+  for(let i=0;i<256;i++){c+=hist[i];if(c>=n*0.35){black=i;break;}}
+  c=0;for(let i=255;i>=0;i--){c+=hist[i];if(c>=n*0.002){white=i;break;}}
+  if(white<=black+2)white=Math.min(255,black+3);
+  const A=12,den=Math.asinh(A),lut=new Uint8Array(256);
+  for(let i=0;i<256;i++){
+    const x=Math.min(1,Math.max(0,(i-black)/(white-black)));
+    lut[i]=Math.round(255*Math.asinh(A*x)/den);
+  }
+  for(let i=0;i<d.length;i+=4){d[i]=lut[d[i]];d[i+1]=lut[d[i+1]];d[i+2]=lut[d[i+2]];}
+  STACK.ctx.putImageData(img,0,0);
+}
+/* the stacked frame, at detector resolution, for the pointing solve to work on */
+function stackGray(){
+  if(!STACK.on||STACK.n<6)return null;
+  pctx.drawImage(STACK.acc,0,0,overlay.width,overlay.height,0,0,GW,GH);
+  const d=pctx.getImageData(0,0,GW,GH).data,g=new Float32Array(NPX);
+  for(let i=0,p=0;i<NPX;i++,p+=4)g[i]=d[p]*0.299+d[p+1]*0.587+d[p+2]*0.114;
+  return g;
+}
+function setStack(on){
+  STACK.on=on;
+  $('stackBtn').dataset.on=on?'1':'0';
+  $('stack').classList.toggle('on',on);
+  if(on){resetStack();setStatus('Stacking. Hold as still as you can — frames are aligned on the sky '+
+    'and averaged, so faint stars build up. Turning more than '+STACK.drift+'° restarts it.','ok');}
+  else setStatus('Stacking off — back to the live frame.','');
+}
+
+/* ============================ astrometric pointing solve ============================
+ The magnetometer is the weakest link in the whole instrument: phone compasses run
+ 5-15 deg out, and at an 8 deg matching gate roughly 33 of the 3400 cataloged objects
+ above the horizon fall inside by chance, so neither a match nor a non-match means
+ much. The sky itself is a better reference than the magnetometer, so solve against it.
+
+ The trick that makes this cheap: angular separations BETWEEN detected sources do not
+ depend on where the camera thinks it is pointing. So pairs can be matched to the
+ catalogue before the pointing is known at all — a matched pair fixes the rotation,
+ and every other source votes on it. The winning rotation is then refit over all
+ inliers (Wahba's problem, solved by polar decomposition) and applied as a standing
+ correction to the device attitude. It solves the field of view at the same time,
+ which the slider could otherwise only guess at.
+==================================================================================== */
+const v3dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const v3cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const v3norm=a=>{const n=Math.hypot(a[0],a[1],a[2]);return n?[a[0]/n,a[1]/n,a[2]/n]:a;};
+const v3sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const v3scale=(a,s)=>[a[0]*s,a[1]*s,a[2]*s];
+const matV=(M,v)=>[v3dot(M[0],v),v3dot(M[1],v),v3dot(M[2],v)];
+const skyVec=(az,el)=>{const c=Math.cos(el*D2R);
+  return[Math.sin(az*D2R)*c,Math.cos(az*D2R)*c,Math.sin(el*D2R)];};
+const angBetween=(a,b)=>Math.acos(Math.max(-1,Math.min(1,v3dot(a,b))))*R2D;
+
+function clearSolve(why){
+  if(!SOLVE.R&&!SOLVE.fail)return;
+  SOLVE.R=null;SOLVE.rms=null;SOLVE.nStars=0;SOLVE.scale=1;SOLVE.fail=why||null;
+  renderDiag();
+}
+
+/* pixel -> unit sky vector through a given basis and focal scale */
+function pixVec(px,py,b,fv){
+  const x=(px/(overlay.width/2)-1)*fv.tx, y=-(py/(overlay.height/2)-1)*fv.ty;
+  return v3norm([b.f[0]+x*b.r[0]+y*b.u[0],
+                 b.f[1]+x*b.r[1]+y*b.u[1],
+                 b.f[2]+x*b.r[2]+y*b.u[2]]);
+}
+/* rotation carrying two observed directions onto two catalogue directions */
+function rotFrom2(a,b,i,j){
+  const e1=a,e2=v3norm(v3sub(b,v3scale(a,v3dot(a,b)))),e3=v3cross(e1,e2);
+  const f1=i,f2=v3norm(v3sub(j,v3scale(i,v3dot(i,j)))),f3=v3cross(f1,f2);
+  const R=[[0,0,0],[0,0,0],[0,0,0]];
+  for(let r=0;r<3;r++)for(let c=0;c<3;c++)R[r][c]=f1[r]*e1[c]+f2[r]*e2[c]+f3[r]*e3[c];
+  return R;
+}
+/* optimal rotation over all correspondences: orthogonal factor of the attitude
+   profile matrix, by Newton polar decomposition */
+function wahba(obs,cat){
+  let B=[[0,0,0],[0,0,0],[0,0,0]];
+  for(let k=0;k<obs.length;k++)
+    for(let r=0;r<3;r++)for(let c=0;c<3;c++)B[r][c]+=cat[k][r]*obs[k][c];
+  let R=B.map(r=>r.slice());
+  for(let it=0;it<12;it++){
+    const d=R[0][0]*(R[1][1]*R[2][2]-R[1][2]*R[2][1])
+           -R[0][1]*(R[1][0]*R[2][2]-R[1][2]*R[2][0])
+           +R[0][2]*(R[1][0]*R[2][1]-R[1][1]*R[2][0]);
+    if(Math.abs(d)<1e-12)break;
+    const I=[[0,0,0],[0,0,0],[0,0,0]];
+    I[0][0]=(R[1][1]*R[2][2]-R[1][2]*R[2][1])/d; I[0][1]=(R[0][2]*R[2][1]-R[0][1]*R[2][2])/d;
+    I[0][2]=(R[0][1]*R[1][2]-R[0][2]*R[1][1])/d; I[1][0]=(R[1][2]*R[2][0]-R[1][0]*R[2][2])/d;
+    I[1][1]=(R[0][0]*R[2][2]-R[0][2]*R[2][0])/d; I[1][2]=(R[0][2]*R[1][0]-R[0][0]*R[1][2])/d;
+    I[2][0]=(R[1][0]*R[2][1]-R[1][1]*R[2][0])/d; I[2][1]=(R[0][1]*R[2][0]-R[0][0]*R[2][1])/d;
+    I[2][2]=(R[0][0]*R[1][1]-R[0][1]*R[1][0])/d;
+    let mx=0;const N=[[0,0,0],[0,0,0],[0,0,0]];
+    for(let r=0;r<3;r++)for(let c=0;c<3;c++){
+      N[r][c]=0.5*(R[r][c]+I[c][r]);mx=Math.max(mx,Math.abs(N[r][c]-R[r][c]));}
+    R=N; if(mx<1e-12)break;
+  }
+  return R;
+}
+/* brightest local maxima in a frame, as screen coordinates with subpixel centroids */
+function extractSources(gray,maxN){
+  let sum=0;for(let i=0;i<NPX;i++)sum+=gray[i];
+  const mean=sum/NPX;
+  let ss=0;for(let i=0;i<NPX;i++){const d=gray[i]-mean;ss+=d*d;}
+  const thr=mean+Math.max(3*Math.sqrt(ss/NPX),6);   // 3-sigma: standard for source detection
+  const pts=[];
+  for(let y=1;y<GH-1;y++)for(let x=1;x<GW-1;x++){
+    const i=y*GW+x,v=gray[i];
+    if(v<thr||v<gray[i-1]||v<gray[i+1]||v<gray[i-GW]||v<gray[i+GW])continue;
+    pts.push({x,y,v});
+  }
+  pts.sort((a,b)=>b.v-a.v);
+  const keep=[];
+  for(const p of pts){
+    if(keep.some(k=>Math.abs(k.x-p.x)<3&&Math.abs(k.y-p.y)<3))continue;
+    keep.push(p);if(keep.length>=maxN)break;
+  }
+  return keep.map(p=>{
+    let sw=0,sx=0,sy=0;
+    for(let y=Math.max(0,p.y-2);y<=Math.min(GH-1,p.y+2);y++)
+      for(let x=Math.max(0,p.x-2);x<=Math.min(GW-1,p.x+2);x++){
+        const w=Math.max(0,gray[y*GW+x]-mean);sw+=w;sx+=w*x;sy+=w*y;}
+    const q=procToScreen(sw>0?sx/sw:p.x, sw>0?sy/sw:p.y);
+    return{x:q.x,y:q.y,v:p.v};
+  });
+}
+function solveField(sources,cat,b,fv,opt){
+  opt=opt||{};
+  const tolSep=opt.tolSep||0.6,tolIn=opt.tolIn||0.9,minIn=opt.minIn||4;
+  const cone=Math.cos((opt.cone||45)*D2R);
+  const catV=cat.map(c=>({v:skyVec(c.az,c.el),c})).filter(o=>v3dot(o.v,b.f)>=cone);
+  if(catV.length<3)return{ok:false,reason:'too few catalogue stars near where you are aiming'};
+  const cp=[];
+  for(let i=0;i<catV.length;i++)for(let j=i+1;j<catV.length;j++){
+    const s=angBetween(catV[i].v,catV[j].v);
+    if(s>=0.5&&s<=90)cp.push({i,j,s});}
+  cp.sort((a,b2)=>a.s-b2.s);
+  let best=null;
+  for(const sc of (opt.scales||[1])){
+    const fvs={tx:fv.tx*sc,ty:fv.ty*sc};
+    const obs=sources.map(p=>pixVec(p.x,p.y,b,fvs));
+    for(let a=0;a<obs.length;a++)for(let bb=a+1;bb<obs.length;bb++){
+      const s=angBetween(obs[a],obs[bb]);
+      for(const q of cp){
+        if(q.s<s-tolSep)continue;
+        if(q.s>s+tolSep)break;
+        for(const pr of [[q.i,q.j],[q.j,q.i]]){
+          const R=rotFrom2(obs[a],obs[bb],catV[pr[0]].v,catV[pr[1]].v);
+          let n=0,sse=0;const oi=[],ci=[];
+          for(let k=0;k<obs.length;k++){
+            const rv=matV(R,obs[k]);
+            let bd=tolIn,bi=-1;
+            for(let m=0;m<catV.length;m++){
+              const d=angBetween(rv,catV[m].v);
+              if(d<bd){bd=d;bi=m;}}
+            if(bi>=0){n++;sse+=bd*bd;oi.push(obs[k]);ci.push(catV[bi].v);}
+          }
+          if(n>=minIn&&(!best||n>best.n||(n===best.n&&sse<best.sse)))
+            best={n,sse,R,scale:sc,oi,ci};
+        }
+      }
+    }
+  }
+  if(!best)return{ok:false,reason:'no consistent star pattern — too few stars visible'};
+  if(!opt._fine){
+    const fine=[];
+    for(let d=-0.06;d<=0.061;d+=0.02)if(Math.abs(d)>1e-9)fine.push(+(best.scale+d).toFixed(4));
+    const r2=solveField(sources,cat,b,fv,Object.assign({},opt,{scales:fine,_fine:true}));
+    if(r2.ok&&(r2.nStars>best.n||(r2.nStars===best.n&&r2.rms<Math.sqrt(best.sse/best.n))))return r2;
+  }
+  const R=wahba(best.oi,best.ci);
+  let sse=0;
+  for(let k=0;k<best.oi.length;k++){const d=angBetween(matV(R,best.oi[k]),best.ci[k]);sse+=d*d;}
+  return{ok:true,R,scale:best.scale,nStars:best.n,rms:Math.sqrt(sse/best.oi.length)};
+}
+function solveNow(){
+  if(SOLVE.busy)return;
+  if(!basis){setStatus('Turn the compass on first — the solve refines an existing aim.','err');return;}
+  const gray=stackGray()||lastGray;
+  if(!gray){setStatus('No camera frame yet.','err');return;}
+  if(!starsUp.length){setStatus('No star positions yet — set your location first.','err');return;}
+  SOLVE.busy=true;
+  setStatus('Solving against the star field…');
+  setTimeout(()=>{
+    try{
+      const src=extractSources(gray,12);
+      if(src.length<4){
+        SOLVE.fail='only '+src.length+' point sources found';SOLVE.busy=false;renderDiag();
+        setStatus('Only '+src.length+' point sources in frame — the solve needs at least 4 stars. '+
+          'Turn Stack on to pull fainter stars out, aim away from lights, and let the camera adapt.','err');
+        return;
+      }
+      /* solve against the raw device attitude, so the correction is absolute
+         rather than stacked on top of whatever the last solve produced */
+      const nominal=SOLVE.R?rawBasis:basis;
+      const r=solveField(src,starsUp.filter(s=>s.el>0),nominal,rawFov(),
+                         {scales:[0.8,0.9,1.0,1.1,1.25],minIn:4});
+      if(!r.ok){
+        SOLVE.fail=r.reason;SOLVE.busy=false;renderDiag();
+        setStatus('Solve failed: '+r.reason+'. '+src.length+' sources were found but no star pattern '+
+          'fit them. Check the FOV setting is near your camera, or turn Stack on for more stars.','err');
+        return;
+      }
+      SOLVE.R=r.R;SOLVE.rms=r.rms;SOLVE.nStars=r.nStars;SOLVE.scale=r.scale;
+      SOLVE.t=Date.now();SOLVE.fail=null;SOLVE.busy=false;
+      renderDiag();renderSheet();
+      setStatus('Solved on '+r.nStars+' stars — pointing good to '+r.rms.toFixed(2)+
+        '°, field of view '+(2*Math.atan(rawFov().ty*r.scale)*R2D).toFixed(1)+
+        '°. Identification is now held to that accuracy.','ok');
+    }catch(e){SOLVE.busy=false;setStatus('Solve error: '+e.message,'err');}
+  },30);
+}
 
 /* ============================ lock on a light, then identify it ============================
  The track is kept in SKY coordinates, not screen pixels: each detection is
@@ -1277,15 +1597,63 @@ function behaviour(st,ph){
     s+='; brightness swinging widely — tumbling, flaring, or scintillation low in the sky';
   return s;
 }
+
+/* ============================ what the data can actually support ============================
+ A negative claim is much more demanding than a positive one. To say a light matches
+ something, you need it to line up. To say nothing matches, you need to know you would
+ have SEEN the match if it were there — which means the pointing has to be tight enough
+ for "nothing within the gate" to mean anything, and the aircraft feed has to have been
+ live at all. Neither was previously checked, so the app would print UNIDENTIFIED in the
+ same breath as admitting it never had aircraft data. Those cases now refuse to
+ adjudicate instead.
+========================================================================================= */
+function tleAgeHours(){
+  const g=SATENGINE.stats().generated;
+  if(!g)return null;
+  const h=(Date.now()-new Date(g).getTime())/3600000;
+  return isFinite(h)?h:null;
+}
+function dataQuality(){
+  const issues=[],blocking=[];
+  let gate=LOCK_GATE, aim;
+  if(solveLive()){
+    /* the gate is now a measured quantity: a few times the solve residual */
+    gate=Math.max(0.4,SOLVE.rms*3+0.25);
+    aim='solved on '+SOLVE.nStars+' stars, ±'+SOLVE.rms.toFixed(2)+'°';
+  }else{
+    aim='magnetometer only';
+    const why=SOLVE.fail?'the last solve failed ('+SOLVE.fail+')':'no astrometric solve has been run';
+    blocking.push('Pointing comes from the magnetometer, routinely 5-15° out, because '+why+
+      '. At a '+LOCK_GATE+'° gate about '+Math.round(3400*(1-Math.cos(LOCK_GATE*D2R))/2)+
+      ' catalogued objects fall inside by chance, so "nothing matches" carries almost no weight. '+
+      'Press Solve on a star field to fix this.');
+  }
+  if(diag.compass==='rel')
+    issues.push('the compass has no true north, so azimuths carry whatever offset the trim slider is set to');
+  if(!/rx/.test(diag.air))
+    blocking.push('No live aircraft feed ('+diag.air+'), so aircraft were never in the comparison. '+
+      'Aircraft are the single most common explanation for an unfamiliar light.');
+  else
+    issues.push('ADS-B only carries aircraft that transmit it — military and some light aircraft do not');
+  const age=tleAgeHours();
+  /* stale elements drift along-track, so satellites get a wider gate rather than a footnote */
+  const tleSlop=age==null?0.5:Math.min(3,age/24*0.4);
+  if(age!=null&&age>72)
+    issues.push('satellite elements are '+Math.round(age/24)+' days old, so orbital positions have drifted');
+  issues.push('the satellite catalogue excludes classified objects');
+  return{gate,aim,issues,blocking,tleSlop,age};
+}
 function assess(){
   const st=trackStats(),ph=photometry();
   const S=LOCK.samples.filter(s=>s.az!=null&&!s.dark);
   const last=S.length?S[S.length-1]:null;
   if(!last)return{label:'no sky fix',st,ph,list:[]};
   if(!st)return{label:'measuring…',st,ph,list:[],pos:last};
+  const Q=dataQuality();
   const list=candidates()
-    .map(c=>({...c,sep:angSepDeg(last.az,last.el,c.az,c.el)}))
-    .filter(c=>c.sep<=LOCK_GATE*2)
+    .map(c=>({...c,sep:angSepDeg(last.az,last.el,c.az,c.el),
+              gate:Q.gate+(c.kind==='sat'?Q.tleSlop:0)}))
+    .filter(c=>c.sep<=Math.max(Q.gate*2,3))
     .sort((a,b)=>a.sep-b.sep).slice(0,6);
   /* A regular 0.5-3 Hz beacon that goes fully dark is aircraft behaviour. Nothing in
      orbit and nothing in the star catalogue does it, so a strobe rules those out even
@@ -1296,14 +1664,17 @@ function assess(){
     c.rateOk=rateAgrees(st.rate,c.rate);
     c.vetoed=strobing&&!!NOT_STROBERS[c.kind];
   });
-  const inGate=list.filter(c=>c.sep<=LOCK_GATE);
+  const inGate=list.filter(c=>c.sep<=c.gate);
   const agree=inGate.filter(c=>c.rateOk===true&&!c.vetoed);
   let label,best=null,kind;
   if(agree.length){best=agree[0];label=best.name;kind='match';}
   else if(strobing){label='UNIDENTIFIED';kind='none';}   // beacon, but nothing in the feed fits
   else if(inGate.length){best=inGate[0];label='motion disagrees';kind='conflict';}
   else{label='UNIDENTIFIED';kind='none';}
-  return{label,kind,best,list,st,ph,pos:last,strobing,note:behaviour(st,ph)};
+  /* Ruling everything out requires data good enough to have found a match. Without it
+     the honest answer is that the question cannot be settled, not that it is a mystery. */
+  if(kind==='none'&&Q.blocking.length){kind='insufficient';label='CANNOT ADJUDICATE';best=null;}
+  return{label,kind,best,list,st,ph,pos:last,strobing,Q,note:behaviour(st,ph)};
 }
 
 overlay.addEventListener('pointerdown',e=>{
@@ -1311,6 +1682,8 @@ overlay.addEventListener('pointerdown',e=>{
   const r=overlay.getBoundingClientRect();
   startLock(e.clientX-r.left,e.clientY-r.top);
 });
+$('solve').addEventListener('click',solveNow);
+$('stackBtn').addEventListener('click',()=>setStack(!STACK.on));
 $('lock').addEventListener('click',()=>{
   if(LOCK.on){dropLock('you dropped it');return;}
   /* no tap target: fall back to whatever the motion detector last flagged */
@@ -1356,6 +1729,7 @@ function loop(){
     }
   }
   if(gray)trackLock(gray,rgb);
+  stackFrame();
   drawOverlay();
   if(gray&&prev){
     const thr=+$('sens').value;let changed=0,best=-1,bx=0,by=0;
@@ -1378,7 +1752,8 @@ $('capture').addEventListener('click',()=>{
   const cap=document.createElement('canvas');cap.width=overlay.width;cap.height=overlay.height;
   const cx=cap.getContext('2d');
   const vw=video.videoWidth,vh=video.videoHeight;
-  if(vw&&vh){const s=Math.max(cap.width/vw,cap.height/vh);
+  if(STACK.on&&STACK.n>0)cx.drawImage($('stack'),0,0);   // save the stack, not one noisy frame
+  else if(vw&&vh){const s=Math.max(cap.width/vw,cap.height/vh);
     cx.drawImage(video,(cap.width-vw*s)/2,(cap.height-vh*s)/2,vw*s,vh*s);}
   cx.drawImage(overlay,0,0);
   lastCapture=cap;
@@ -1439,6 +1814,7 @@ function analyze(cap,aimBasis,aimFov){
 }
 
 /* ============================ panels ============================ */
+initStack();
 const _colCache={};
 function cssColor(v){const k=v.replace('var(','').replace(')','');
   return _colCache[k]||(_colCache[k]=
@@ -1500,9 +1876,11 @@ function lockPanel(){
     return '<div class="hint">Tracking — hold the light near the reticle. '+
       LOCK.samples.length+' samples so far; a verdict needs about a second of steady track.</div>';
   const st=v.st,ph=v.ph,pos=v.pos;
-  const head=v.kind==='match'?'var(--lock)':v.kind==='none'?'var(--hit)':'var(--planet)';
+  const head=v.kind==='match'?'var(--lock)':v.kind==='none'?'var(--hit)':
+             v.kind==='insufficient'?'var(--dim)':'var(--planet)';
   const title=v.kind==='match'?'MATCH · '+v.best.name
             :v.kind==='conflict'?'NEAREST OBJECT DISAGREES'
+            :v.kind==='insufficient'?'CANNOT ADJUDICATE'
             :'NO CATALOGUE MATCH';
   let h='<div class="obj"><span class="nm" style="color:'+head+'"><b>'+title+'</b></span>'+
         '<span class="v">'+st.rate.toFixed(3)+'°/s · '+Math.round(st.bearing)+'° pa</span></div>';
@@ -1511,6 +1889,8 @@ function lockPanel(){
      Math.round(pos.az)+'° · el '+Math.round(pos.el)+'°</span></div>';
   h+='<div class="obj"><span class="nm">track</span><span class="v">'+st.n+' samples · '+
      st.span.toFixed(1)+'s · scatter '+st.scatter.toFixed(2)+'°</span></div>';
+  h+='<div class="obj"><span class="nm">pointing</span><span class="v">'+v.Q.aim+
+     ' · gate ±'+v.Q.gate.toFixed(2)+'°</span></div>';
   if(ph)h+='<div class="obj"><span class="nm"><span class="dot" style="background:rgb('+
      ph.r+','+ph.g+','+ph.b+')"></span>light</span><span class="v">'+
      Math.round(ph.mean)+' over sky · var '+(ph.cv*100).toFixed(0)+'%'+
@@ -1527,29 +1907,32 @@ function lockPanel(){
       c.rateOk===true?'var(--lock)':c.rateOk===false?'var(--hit)':'var(--dim)';
     h+='<div class="obj"><span class="nm">'+c.name+
        ' <span style="color:var(--dim)">'+c.kind+(c.meta?' '+c.meta:'')+'</span></span>'+
-       '<span class="v">'+c.sep.toFixed(1)+'° off · <span style="color:'+col+'">'+mark+'</span>'+
+       '<span class="v">'+c.sep.toFixed(2)+'° off'+(c.sep<=c.gate?'':' (outside gate)')+
+       ' · <span style="color:'+col+'">'+mark+'</span>'+
        (c.rate!=null?' · '+c.rate.toFixed(3)+'°/s':'')+'</span></div>';
   });
 
   /* What "unidentified" is actually allowed to mean here. */
-  const caveats=[];
-  caveats.push('compass error moves everything together — a few degrees is normal, so separation alone never settles it');
-  if(diag.compass==='rel')caveats.push('this compass has no true north; azimuths are offset by whatever the trim slider is set to');
-  if(diag.air!=='ok'&&!/rx/.test(diag.air))caveats.push('no live aircraft feed, so planes are not in the comparison at all');
-  else caveats.push('ADS-B only sees aircraft that transmit it — military and some light aircraft do not');
-  caveats.push('the satellite catalogue excludes classified objects and is '+
-    (SATENGINE.stats().generated?stats_gen().replace(' · TLEs ','').replace(' old','')+' old':'of unknown age'));
+  const Q=v.Q;
+  if(Q.blocking.length){
+    h+='<div class="hint" style="padding:.4rem 0 .1rem;color:var(--hit)"><b>Why this cannot be settled</b></div>';
+    Q.blocking.forEach(t=>h+='<div class="hint" style="padding:.1rem 0;color:var(--hit)">• '+t+'</div>');
+  }
   h+='<div class="hint" style="padding:.35rem 0 0;color:var(--dim)">'+
-     (v.kind==='none'&&v.strobing
-       ? 'It strobes like an aircraft beacon, which rules out the satellites and stars nearby whatever '+
-         'their position says. No aircraft in the feed fits — usual causes are an aircraft not '+
-         'transmitting ADS-B, or no feed at all — '
+     (v.kind==='insufficient'
+       ? 'Nothing in the catalogues matched, but the checks above were not good enough to '+
+         'call that meaningful — fix them and take the reading again. '
+       : v.kind==='none'&&v.strobing
+       ? 'It strobes like an aircraft beacon, which rules out the satellites and stars nearby '+
+         'whatever their position says. No aircraft in the feed fits. '
        : v.kind==='none'
-       ? 'No catalogued object sits within '+LOCK_GATE+'° with matching motion. That means unmatched against what this app can see, which is not the same as unexplained — '
+       ? 'No catalogued object sits within '+Q.gate.toFixed(2)+'° with matching motion. '+
+         'That is unmatched against what this app can see, which is not the same as unexplained. '
        : v.kind==='conflict'
-       ? 'The nearest object is close in the sky but moves differently, so the identification is not supported — '
-       : 'Matched on both position and motion — ')+
-     'bear in mind: '+caveats.join('; ')+'.</div>';
+       ? 'The nearest object is close in the sky but moves differently, so the identification '+
+         'is not supported. '
+       : 'Matched on both position and motion. ')+
+     'Standing limits: '+Q.issues.join('; ')+'.</div>';
   return h;
 }
 function stats_gen(){
