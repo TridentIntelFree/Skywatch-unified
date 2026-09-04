@@ -32,6 +32,10 @@
   #proc{display:none}
   #stack{position:absolute;inset:0;width:100%;height:100%;display:none}
   #stack.on{display:block}
+  /* Real-time intensification: gain and contrast on the GPU, costing no pixel readback,
+     over a motion-adaptive rolling average. This is about as close to a night-vision
+     tube as a phone camera gets. */
+  #stack.boost{filter:brightness(var(--boost,2.2)) contrast(1.35) saturate(.55)}
 
   header{position:absolute;top:0;left:0;right:0;z-index:5;pointer-events:none;
     display:flex;align-items:baseline;gap:.5rem;padding:.5rem .7rem;
@@ -178,6 +182,7 @@
     <div class="slide"><label>Sensitivity</label><input type="range" id="sens" min="6" max="60" value="26"><output id="oSens">26</output></div>
     <div class="slide"><label>Camera FOV</label><input type="range" id="fov" min="25" max="120" value="68"><output id="oFov">68°</output></div>
     <div class="slide"><label>Heading trim</label><input type="range" id="trim" min="-180" max="180" value="0"><output id="oTrim">0°</output></div>
+    <div class="slide"><label>Enhance</label><input type="range" id="gain" min="2" max="30" step="1" value="12"><output id="oGain">12</output></div>
     <div class="slide"><label>Star mag ≤</label><input type="range" id="smag" min="1.5" max="6.5" step="0.5" value="4.0"><output id="oSmag">4.0</output></div>
     <div class="slide"><label>Sat TLE URL</label><input type="text" id="tleUrl" value="https://celestrak.org/NORAD/elements/gp.php?GROUP=visual&FORMAT=tle"></div>
     <div class="slide"><label>Star DB URL</label><input type="text" id="starUrl" placeholder="optional: hosted catalog JSON [[name,ra°,dec°,mag],…] or CSV"></div>
@@ -212,7 +217,8 @@
   </div>
 
   <div class="btnrow modes">
-    <button class="tog" id="nightBtn" data-on="0">Night vision</button>
+    <button class="tog" id="viewBtn" data-on="0">View · Live</button>
+    <button class="tog" id="nightBtn" data-on="0">Red UI</button>
     <button class="tog" id="setupToggle" data-on="0">Setup</button>
   </div>
 </div>
@@ -688,12 +694,15 @@ const SOLVE_TTL=240;         // s — magnetometer bias drifts, and so does a co
 const SOLVE={R:null,rms:null,nStars:0,scale:1,t:0,fail:null,busy:false};
 const solveAgeS=()=>SOLVE.R?(Date.now()-SOLVE.t)/1000:null;
 const solveLive=()=>!!SOLVE.R&&(Date.now()-SOLVE.t)<SOLVE_TTL*1000;
-const STACK={on:false,n:0,ref:null,fov:null,acc:null,actx:null,ctx:null,
-             drift:6,lastPaint:0};
+const STACK={on:false,n:0,kept:0,ref:null,fov:null,ctx:null,warp:null,wctx:null,
+             mean:null,mctx:null,sum:null,cov:null,w:0,h:0,refSrc:null,rms:null,
+             drift:6,maxRate:8,lastPaint:0,lastRef:0,rate:0,
+             sharpBest:null,hist:[],skip:{move:0,blur:0,drift:0,align:0}};
 const LOCK={on:false,samples:[],rad:14,started:0,verdict:null,lastCalc:0,
             lastSeen:0,seed:{x:0,y:0},pol:1,starPsf:null};
 const SCAN={on:false,events:[],occ:[],last:0,dcur:null,dctx:null,dref:null,rctx:null,
             base:new Map(),globalDim:false,noise:0,nStars:0};
+const VIEWS=['live','boost','stack'];
 let aircraft=[], satrecs=[], knowns=[];   // knowns: {name,az,el,color,kind}
 let starsUp=[], dsoUp=[], radUp=[];       // fixed-sky layers, refreshed with knowns
 let lastCapture=null;
@@ -710,12 +719,14 @@ function engineVisible(){
 function setStatus(t,c){const s=$('status');s.textContent=t;s.className=c||'';s.dataset.kind=c||'';}
 const statusIsError=()=>$('status').dataset.kind==='err';
 function fit(){overlay.width=innerWidth;overlay.height=innerHeight;
-  if(STACK.acc&&STACK.on)resetStack();}
+  if(STACK.sum&&STACK.on)resetStack();}
 addEventListener('resize',fit);fit();
 
 /* sliders */
-['sens','fov','trim','smag'].forEach(id=>{const el=$(id),o=$('o'+id[0].toUpperCase()+id.slice(1));
-  const upd=()=>{o.textContent=id==='sens'?el.value:(id==='smag'?(+el.value).toFixed(1):el.value+'°');
+['sens','fov','trim','smag','gain'].forEach(id=>{const el=$(id),o=$('o'+id[0].toUpperCase()+id.slice(1));
+  const upd=()=>{o.textContent=(id==='fov'||id==='trim')?el.value+'°'
+                 :(id==='smag'?(+el.value).toFixed(1):el.value);
+    if(id==='gain')applyGain();
     if(id==='fov')$('hFov').textContent=el.value+'°';
     if(id==='smag')refreshSky();
     /* both of these are the very things a solve measures, so a hand adjustment
@@ -735,6 +746,8 @@ const on=k=>tog[k].dataset.on==='1';
    just falls back to the defaults. */
 const remember=(k,v)=>{try{localStorage.setItem(k,v?'1':'0');}catch(e){}};
 const recall=(k,d)=>{try{const v=localStorage.getItem(k);return v==null?d:v==='1';}catch(e){return d;}};
+const rememberStr=(k,v)=>{try{localStorage.setItem(k,v);}catch(e){}};
+const recallStr=(k,d)=>{try{return localStorage.getItem(k)||d;}catch(e){return d;}};
 function setSheetOpen(o){
   $('sheet').classList.toggle('open',o);
   $('sheetToggle').setAttribute('aria-expanded',o?'true':'false');
@@ -750,6 +763,7 @@ $('sheetToggle').addEventListener('click',()=>setSheetOpen(!$('sheet').classList
 $('setupToggle').addEventListener('click',()=>setSetupOpen(!$('setup').classList.contains('open')));
 $('nightBtn').addEventListener('click',()=>
   setNight(document.documentElement.getAttribute('data-night')!=='1'));
+$('viewBtn').addEventListener('click',cycleView);
 
 /* Tapping a tab means you want to read it, so it also opens a collapsed sheet.
    Switching tabs from code (a new lock) does not — it must never cover the sky
@@ -783,7 +797,12 @@ function renderChips(){
                   /rx/.test(diag.air)?'ok':'warn'));
   c.push(chipHtml(engineReady?'SAT '+Math.round(SATENGINE.stats().visible/100)/10+'k':'SAT …',
                   engineReady?'ok':'warn'));
-  if(STACK.on)c.push(chipHtml('STACK '+STACK.n,'ok'));
+  if(STACK.on){
+    const sk=STACK.skip,drop=sk.move+sk.blur+sk.drift+sk.align;
+    c.push(chipHtml('STACK '+STACK.kept,'ok'));
+    /* the number that tells you to hold stiller */
+    if(drop)c.push(chipHtml('DROPPED '+drop, drop>STACK.kept?'bad':'warn'));
+  }
   if(SCAN.on)c.push(chipHtml('SCAN '+scanConfirmed().length,
     scanConfirmed().length?'warn':'ok'));
   $('chips').innerHTML=c.join('');
@@ -795,6 +814,8 @@ function nextStep(){
   if(LOCK.on)      return{el:null,     t:'Locked — hold the light near the reticle while the track builds'};
   if(!STACK.on&&!solveLive())
                    return{el:'stackBtn',t:'Point at open sky, then <b>Stack</b> to pull faint stars out'};
+  if(STACK.on&&STACK.rate>STACK.maxRate)
+                   return{el:null,t:'Moving too fast — frames are being dropped. <b>Hold steady</b>'};
   if(!solveLive()) return{el:'solve',  t:'<b>Solve</b> to fix the aim on the star field — until then the compass is 5-15° out'};
   return{el:null,  t:'Ready — <b>tap any light</b> in the view to identify it'};
 }
@@ -1293,6 +1314,63 @@ function drawOverlay(){
 
 
 
+
+/* ============================ display modes ============================
+ Three ways to look at the same camera:
+   Live  — the raw sensor, warts and all.
+   Boost — a motion-adaptive rolling average with hard gain. The averaging window
+           shortens automatically as the phone swings, so it denoises when you hold
+           still and stops ghosting when you pan. All of it is GPU compositing plus a
+           CSS filter, so it runs at frame rate with no pixel readback.
+   Stack — the deep integration: hundreds of star-aligned frames, coverage-normalised
+           and asinh-stretched. Slow to build, far and away the cleanest.
+====================================================================== */
+let VIEW='live';
+const NV={c:null,ctx:null};
+function applyGain(){
+  const g=+$('gain').value;
+  document.documentElement.style.setProperty('--boost',(1+g/9).toFixed(2));
+}
+function sizeView(){
+  const W=overlay.width,H=overlay.height;
+  if($('stack').width!==W||$('stack').height!==H){$('stack').width=W;$('stack').height=H;}
+  if(!NV.c){NV.c=document.createElement('canvas');NV.ctx=NV.c.getContext('2d');}
+  if(NV.c.width!==W||NV.c.height!==H){
+    NV.c.width=W;NV.c.height=H;NV.ctx.fillStyle='#000';NV.ctx.fillRect(0,0,W,H);}
+}
+function setView(v){
+  VIEW=v;
+  const shown=v!=='live';
+  sizeView();
+  $('stack').classList.toggle('on',shown);
+  $('stack').classList.toggle('boost',v==='boost');
+  $('viewBtn').dataset.on=shown?'1':'0';
+  $('viewBtn').textContent='View · '+(v==='live'?'Live':v==='boost'?'Boost':'Stack');
+  if(v==='stack'&&!STACK.on)setStack(true);
+  if(v==='boost')setStatus('Boost: frames averaged just long enough to kill the noise, and '+
+    'the window shortens by itself when you move so it will not smear. Use the Enhance '+
+    'slider under Setup for gain.','ok');
+  else if(v==='stack')setStatus('Showing the deep stack. Hold steady — every well-registered '+
+    'frame goes in, and dropped ones are listed under Sky now.','ok');
+  else if(shown===false)setStatus('Live camera.','');
+  rememberStr('sw.view',v);
+  renderBar();
+}
+function cycleView(){setView(VIEWS[(VIEWS.indexOf(VIEW)+1)%VIEWS.length]);}
+/* rolling average whose time constant follows how fast the phone is actually moving */
+function paintBoost(){
+  if(!running)return;
+  sizeView();
+  const W=overlay.width,H=overlay.height;
+  /* long window when still (about 3x cleaner), collapsing to none when you pan so it
+     never smears — the same trade a night-vision tube makes */
+  const a=Math.min(1,Math.max(0.18,0.18+STACK.rate*0.09));
+  NV.ctx.globalAlpha=a;
+  if(!drawCameraFrame(NV.ctx,W,H)){NV.ctx.globalAlpha=1;return;}
+  NV.ctx.globalAlpha=1;
+  STACK.ctx.drawImage(NV.c,0,0);
+}
+
 /* ============================ frame stacking for low light ============================
  A phone sensor in one 1/30 s video frame is shot-noise limited, and most of the sky
  is below its floor. Averaging N frames drops the noise as sqrt(N) — 16 frames is 4x
@@ -1308,19 +1386,33 @@ function drawOverlay(){
  on, and a sharper solve means sharper alignment for the next stack.
 ==================================================================================== */
 function initStack(){
-  STACK.acc=document.createElement('canvas');
-  STACK.actx=STACK.acc.getContext('2d',{willReadFrequently:true});
+  STACK.warp=document.createElement('canvas');
+  STACK.wctx=STACK.warp.getContext('2d',{willReadFrequently:true});
+  STACK.mean=document.createElement('canvas');   // coverage-normalised mean, unstretched
+  STACK.mctx=STACK.mean.getContext('2d',{willReadFrequently:true});
   STACK.ctx=$('stack').getContext('2d');
 }
 function resetStack(){
   const W=overlay.width,H=overlay.height;
-  STACK.acc.width=W;STACK.acc.height=H;
+  if(!W||!H)return;
+  STACK.warp.width=W;STACK.warp.height=H;
+  STACK.mean.width=W;STACK.mean.height=H;
   $('stack').width=W;$('stack').height=H;
-  STACK.actx.setTransform(1,0,0,1,0,0);
-  STACK.actx.fillStyle='#000';STACK.actx.fillRect(0,0,W,H);
+  /* Float32 sums with a per-pixel coverage count, not an 8-bit running mean. Repeated
+     8-bit blending quantises every step, which measured out at 6.2x SNR after 64
+     frames against an ideal of 8x; summing in float has no such ceiling, and the
+     coverage map means edges exposed by the warp are averaged over what actually
+     landed there rather than decaying towards stale content. */
+  STACK.sum=new Float32Array(W*H*3);
+  STACK.cov=new Float32Array(W*H);
+  STACK.w=W;STACK.h=H;
   STACK.ctx.setTransform(1,0,0,1,0,0);
   STACK.ctx.fillStyle='#000';STACK.ctx.fillRect(0,0,W,H);
-  STACK.n=0;STACK.ref=null;
+  STACK.mctx.setTransform(1,0,0,1,0,0);
+  STACK.mctx.fillStyle='#000';STACK.mctx.fillRect(0,0,W,H);
+  STACK.n=0;STACK.kept=0;STACK.ref=null;STACK.refSrc=null;
+  STACK.skip={move:0,blur:0,drift:0,align:0};
+  STACK.sharpBest=null;STACK.lastRef=0;STACK.rms=null;
 }
 /* current frame -> the frame the stack started in, as an affine through three corners */
 function alignAffine(){
@@ -1337,41 +1429,175 @@ function alignAffine(){
            c:(q3[0]-q1[0])/H,d:(q3[1]-q1[1])/H,e:q1[0],f:q1[1]};
   return isFinite(M.a+M.b+M.c+M.d+M.e+M.f)?M:null;
 }
+/* Refine that attitude guess against the picture itself.
+   The magnetometer and accelerometer are good to a few tenths of a degree, which at
+   this plate scale is several pixels — enough that a sensor-only stack records your
+   hand rather than the sky. The stars in the frame are a far better ruler, so match
+   the detected sources against the ones already in the stack and solve the residual
+   rotation and shift (orthogonal Procrustes). It is computed from sources found in the
+   proc frame we already have, so it costs no extra pixel readback, and it tracks the
+   sky's own sidereal drift for free. */
+function alignRefine(M,src){
+  const ref=STACK.refSrc;
+  if(!ref||ref.length<3||!src||src.length<3)return null;
+  const P=[],Q=[];
+  for(const s of src){
+    const x=M.a*s.x+M.c*s.y+M.e, y=M.b*s.x+M.d*s.y+M.f;
+    let best=null,bd=10;
+    for(const r of ref){const d=Math.hypot(r.x-x,r.y-y);if(d<bd){bd=d;best=r;}}
+    if(best){P.push([x,y]);Q.push([best.x,best.y]);}
+  }
+  if(P.length<3)return null;
+  let px=0,py=0,qx=0,qy=0;
+  for(let i=0;i<P.length;i++){px+=P[i][0];py+=P[i][1];qx+=Q[i][0];qy+=Q[i][1];}
+  px/=P.length;py/=P.length;qx/=Q.length;qy/=Q.length;
+  let sn=0,cs=0;
+  for(let i=0;i<P.length;i++){
+    const ax=P[i][0]-px,ay=P[i][1]-py,bx=Q[i][0]-qx,by=Q[i][1]-qy;
+    cs+=ax*bx+ay*by; sn+=ax*by-ay*bx;
+  }
+  const th=Math.atan2(sn,cs),c=Math.cos(th),sg=Math.sin(th);
+  const tx=qx-(c*px-sg*py), ty=qy-(sg*px+c*py);
+  let ss=0;
+  for(let i=0;i<P.length;i++){
+    const rx=c*P[i][0]-sg*P[i][1]+tx-Q[i][0];
+    const ry=sg*P[i][0]+c*P[i][1]+ty-Q[i][1];
+    ss+=rx*rx+ry*ry;}
+  return{c,s:sg,tx,ty,n:P.length,rms:Math.sqrt(ss/P.length)};
+}
+const composeM=(k,M)=>({a:k.c*M.a-k.s*M.b, b:k.s*M.a+k.c*M.b,
+                        c:k.c*M.c-k.s*M.d, d:k.s*M.c+k.c*M.d,
+                        e:k.c*M.e-k.s*M.f+k.tx, f:k.s*M.e+k.c*M.f+k.ty});
+/* median blur width of whatever the frame actually contains — the lucky-imaging test */
+function frameSharpness(gray,src){
+  if(!src||src.length<2)return null;
+  const w=[];
+  for(const s of src){
+    const q=screenToProc(s.x,s.y);
+    const b=findBlob(gray,q.x,q.y,4,1,6);
+    if(b&&b.width!=null)w.push(b.width);
+  }
+  if(w.length<2)return null;
+  w.sort((a,b)=>a-b);
+  return w[w.length>>1];
+}
+/* How fast the phone is really swinging. Measured against a sample a quarter second
+   back, not the previous frame: sensor jitter does not accumulate over that baseline so
+   it averages away, while a genuine pan grows linearly. Frame-to-frame differencing put
+   a stationary phone at about 6°/s of pure noise, which defeated every gate that read
+   it. Boost and the stack quality gate both depend on this number. */
+function updateRate(){
+  if(!basis)return;
+  const t=performance.now(),H=STACK.hist;
+  H.push({t,f:basis.f.slice()});
+  while(H.length>2&&t-H[0].t>800)H.shift();
+  /* Take the largest excursion in the window, not the net one. A shake that returns
+     to where it started has almost no net displacement over 250ms yet blurs every
+     frame, so net-only differencing let 64 smeared frames through in testing. */
+  let best=0,found=false;
+  for(const h of H){
+    const dt=(t-h.t)/1000;
+    if(dt<0.15)break;
+    const r=angBetween(basis.f,h.f)/dt;
+    if(r>best)best=r;
+    found=true;
+  }
+  if(found)STACK.rate=best;
+}
 function stackFrame(){
   if(!STACK.on||!running||!basis)return;
-  const vw=video.videoWidth,vh=video.videoHeight;
-  if(!vw||!vh)return;
   const W=overlay.width,H=overlay.height;
-  if(STACK.acc.width!==W||STACK.acc.height!==H)resetStack();
+  if(!video.videoWidth||!video.videoHeight)return;
+  if(STACK.w!==W||STACK.h!==H||!STACK.sum)resetStack();
   if(!STACK.ref){
     STACK.ref={f:basis.f.slice(),r:basis.r.slice(),u:basis.u.slice()};
     STACK.fov={tx:FOV.tx,ty:FOV.ty};
   }
-  if(angBetween(basis.f,STACK.ref.f)>STACK.drift){resetStack();return;}
+  /* Drifting off no longer throws the stack away. It is anchored to the sky, so a
+     glance away and back leaves it perfectly valid — just skip what does not overlap. */
+  if(angBetween(basis.f,STACK.ref.f)>STACK.drift){STACK.skip.drift++;return;}
+  /* Coarse guard only. Gating tightly on sensor-derived rate throws away good frames,
+     because magnetometer noise at 30 Hz looks exactly like a fast swing — it cost about
+     70% of the usable frames in testing. Whether a frame is actually smeared is decided
+     from the picture below, by its own blur width. */
+  if(STACK.rate>STACK.maxRate){STACK.skip.move++;return;}
+
   const M=alignAffine();
   if(!M)return;
-  STACK.actx.save();
-  STACK.actx.setTransform(M.a,M.b,M.c,M.d,M.e,M.f);
-  STACK.actx.globalAlpha=1/(STACK.n+1);        // running mean, so noise falls as sqrt(n)
-  drawCameraFrame(STACK.actx,W,H);
-  STACK.actx.restore();
-  STACK.n++;
+  const src=lastGray?extractSources(lastGray,12):null;
+  const sharp=lastGray?frameSharpness(lastGray,src):null;
+  if(sharp!=null){
+    if(STACK.sharpBest==null||sharp<STACK.sharpBest)STACK.sharpBest=sharp;
+    else STACK.sharpBest=STACK.sharpBest*0.999+sharp*0.001;   // relax slowly
+    if(STACK.kept>6&&sharp>1.7*STACK.sharpBest){STACK.skip.blur++;return;}
+  }
+  let Mc=M;
+  const k=alignRefine(M,src);
+  if(k){
+    STACK.rms=k.rms;
+    /* residual of the fitted rigid transform, so this is "the matches disagree",
+       not "it moved" — a large shift is corrected, a bad match cannot be */
+    if(k.rms>4){STACK.skip.align++;return;}
+    Mc=composeM(k,M);
+  }
+
+  STACK.wctx.setTransform(1,0,0,1,0,0);
+  STACK.wctx.clearRect(0,0,W,H);
+  STACK.wctx.setTransform(Mc.a,Mc.b,Mc.c,Mc.d,Mc.e,Mc.f);
+  drawCameraFrame(STACK.wctx,W,H);
+  STACK.wctx.setTransform(1,0,0,1,0,0);
+  const d=STACK.wctx.getImageData(0,0,W,H).data;
+  const sum=STACK.sum,cov=STACK.cov,NP=W*H;
+  for(let i=0,p=0,q=0;i<NP;i++,p+=4,q+=3){
+    if(d[p+3]<8)continue;                      // outside the warped frame: no data here
+    sum[q]+=d[p];sum[q+1]+=d[p+1];sum[q+2]+=d[p+2];cov[i]++;
+  }
+  STACK.n++;STACK.kept++;
   const now=Date.now();
   if(now-STACK.lastPaint>400){STACK.lastPaint=now;paintStack();}
+  if(now-STACK.lastRef>1500){STACK.lastRef=now;refreshRefSrc();}
+}
+/* the star pattern the next frame will be matched against, taken from the stack
+   itself because that is where the stars are sharpest */
+function refreshRefSrc(){
+  const g=stackGray(true);
+  if(g)STACK.refSrc=extractSources(g,14);
 }
 /* asinh stretch off an auto black point: lifts the faint end hard while leaving
    bright stars unclipped, which a linear contrast boost cannot do */
 function paintStack(){
-  const W=overlay.width,H=overlay.height;
-  if(!W||!H)return;
-  const img=STACK.actx.getImageData(0,0,W,H),d=img.data;
+  const W=STACK.w,H=STACK.h;
+  if(!W||!H||!STACK.sum)return;
+  const img=STACK.mctx.createImageData(W,H),d=img.data;
+  const sum=STACK.sum,cov=STACK.cov,NP=W*H;
+  for(let i=0,p=0,q=0;i<NP;i++,p+=4,q+=3){
+    const c=cov[i];
+    if(c>0){
+      d[p]=Math.min(255,sum[q]/c);d[p+1]=Math.min(255,sum[q+1]/c);d[p+2]=Math.min(255,sum[q+2]/c);
+    }
+    d[p+3]=255;
+  }
+  STACK.mctx.putImageData(img,0,0);            // true mean: what scan and solve read
   const hist=new Uint32Array(256);let n=0;
   for(let i=0;i<d.length;i+=44){hist[(d[i]*77+d[i+1]*150+d[i+2]*29)>>8]++;n++;}
-  let c=0,black=0,white=255;
-  for(let i=0;i<256;i++){c+=hist[i];if(c>=n*0.35){black=i;break;}}
-  c=0;for(let i=255;i>=0;i--){c+=hist[i];if(c>=n*0.002){white=i;break;}}
-  if(white<=black+2)white=Math.min(255,black+3);
-  const A=12,den=Math.asinh(A),lut=new Uint8Array(256);
+  /* Anchor the stretch to the measured noise, not to percentiles. On an almost
+     featureless field the 99.8th percentile sits only about three sigma above the
+     median, so a percentile stretch maps pure noise to full white and hands you a
+     screen of confetti. Pinning white at least ten sigma up keeps the background in
+     the bottom of the range and lets only real signal climb out of it. */
+  let c2=0,med=0;
+  for(let i=0;i<256;i++){c2+=hist[i];if(c2>=n*0.5){med=i;break;}}
+  const dev=new Uint32Array(256);
+  for(let i=0;i<256;i++)if(hist[i])dev[Math.abs(i-med)]+=hist[i];
+  c2=0;let mad=1;
+  for(let i=0;i<256;i++){c2+=dev[i];if(c2>=n*0.5){mad=Math.max(1,i);break;}}
+  const sig=mad*1.4826;
+  let p998=255;c2=0;
+  for(let i=255;i>=0;i--){c2+=hist[i];if(c2>=n*0.002){p998=i;break;}}
+  const black=Math.max(0,med-sig);
+  const white=Math.min(255,Math.max(p998,med+10*sig,black+8));
+  STACK.bg=med;STACK.sig=sig;
+  const A=Math.max(2,+$('gain').value),den=Math.asinh(A),lut=new Uint8Array(256);
   for(let i=0;i<256;i++){
     const x=Math.min(1,Math.max(0,(i-black)/(white-black)));
     lut[i]=Math.round(255*Math.asinh(A*x)/den);
@@ -1379,10 +1605,12 @@ function paintStack(){
   for(let i=0;i<d.length;i+=4){d[i]=lut[d[i]];d[i+1]=lut[d[i+1]];d[i+2]=lut[d[i+2]];}
   STACK.ctx.putImageData(img,0,0);
 }
-/* the stacked frame, at detector resolution, for the pointing solve to work on */
-function stackGray(){
-  if(!STACK.on||STACK.n<6)return null;
-  pctx.drawImage(STACK.acc,0,0,overlay.width,overlay.height,0,0,GW,GH);
+/* the stacked mean, at detector resolution, for the solver and the difference imager */
+function stackGray(force){
+  if(!STACK.on||!STACK.sum||(!force&&STACK.kept<6))return null;
+  if(STACK.kept<3)return null;
+  paintStack();
+  pctx.drawImage(STACK.mean,0,0,STACK.w,STACK.h,0,0,GW,GH);
   const d=pctx.getImageData(0,0,GW,GH).data,g=new Float32Array(NPX);
   for(let i=0,p=0;i<NPX;i++,p+=4)g[i]=d[p]*0.299+d[p+1]*0.587+d[p+2]*0.114;
   return g;
@@ -1390,9 +1618,9 @@ function stackGray(){
 function setStack(on){
   STACK.on=on;
   $('stackBtn').dataset.on=on?'1':'0';
-  $('stack').classList.toggle('on',on);
-  if(on){resetStack();setStatus('Stacking. Hold as still as you can — frames are aligned on the sky '+
-    'and averaged, so faint stars build up. Turning more than '+STACK.drift+'° restarts it.','ok');}
+  if(on){resetStack();setStatus('Stacking. Frames are aligned on the stars themselves, not '+
+    'on the compass, and any frame taken mid-movement is thrown away rather than smeared in — '+
+    'so hold steady and it keeps building. Drifting off just pauses it.','ok');}
   else setStatus('Stacking off — back to the live frame.','');
 }
 
@@ -1639,6 +1867,7 @@ function starPsf(gray){
     if(st.el<=0||st.mag>3.5)continue;
     const p=project(st.az,st.el);if(!p)continue;
     const q=screenToProc(p.x,p.y);
+    if(q.x<4||q.y<4||q.x>GW-5||q.y>GH-5)continue;
     const b=findBlob(gray,q.x,q.y,4,1,8);
     if(b&&b.width!=null)w.push(b.width);
     if(w.length>=12)break;
@@ -1964,7 +2193,7 @@ function blur3(g){
     g[i]=(u+t[i]+dn)/3;}
 }
 function scanDiff(){
-  if(!STACK.on||STACK.n<12||!STACK.ref||!basis)return null;
+  if(!STACK.on||STACK.kept<12||!STACK.ref||!basis)return null;
   const vw=video.videoWidth,vh=video.videoHeight;
   if(!vw||!vh)return null;
   const M=alignAffine();if(!M)return null;
@@ -1975,7 +2204,7 @@ function scanDiff(){
   drawCameraFrame(SCAN.dctx,W,H);
   SCAN.dctx.setTransform(1,0,0,1,0,0);
   SCAN.rctx.clearRect(0,0,GW,GH);
-  SCAN.rctx.drawImage(STACK.acc,0,0,W,H,0,0,GW,GH);
+  SCAN.rctx.drawImage(STACK.mean,0,0,W,H,0,0,GW,GH);
   const a=SCAN.dctx.getImageData(0,0,GW,GH).data;
   const b=SCAN.rctx.getImageData(0,0,GW,GH).data;
   const ga=new Float32Array(NPX),gb=new Float32Array(NPX);
@@ -2046,6 +2275,7 @@ function scanOccult(gray){
     if(st.el<=0||st.mag>3.9)continue;
     const p=project(st.az,st.el);if(!p)continue;
     const q=screenToProc(p.x,p.y);
+    if(q.x<3||q.y<3||q.x>GW-4||q.y>GH-4)continue;   // outside the frame, not measurable
     const bl=findBlob(gray,q.x,q.y,3,1,0);
     const flux=bl?Math.max(0,bl.contrast):0;
     let rec=SCAN.base.get(st.name);
@@ -2135,7 +2365,9 @@ function loop(){
     }
   }
   if(gray){trackLock(gray,rgb);runScan(gray);}
+  updateRate();
   stackFrame();
+  if(VIEW==='boost')paintBoost();
   drawOverlay();
   if(gray&&prev){
     const thr=+$('sens').value;let changed=0,best=-1,bx=0,by=0;
@@ -2158,7 +2390,7 @@ $('capture').addEventListener('click',()=>{
   const cap=document.createElement('canvas');cap.width=overlay.width;cap.height=overlay.height;
   const cx=cap.getContext('2d');
   const vw=video.videoWidth,vh=video.videoHeight;
-  if(STACK.on&&STACK.n>0)cx.drawImage($('stack'),0,0);   // save the stack, not one noisy frame
+  if(VIEW!=='live')cx.drawImage($('stack'),0,0);   // save what you are looking at
   else if(vw&&vh){const s=Math.max(cap.width/vw,cap.height/vh);
     cx.drawImage(video,(cap.width-vw*s)/2,(cap.height-vh*s)/2,vw*s,vh*s);}
   cx.drawImage(overlay,0,0);
@@ -2266,6 +2498,21 @@ function renderSheet(){
       `<span class="v">az ${Math.round(s.az)}° · el ${Math.round(s.el)}° · m${s.mag.toFixed(1)}</span></div>`).join('');
     const nStars=starsUp.filter(s=>s.el>0&&s.mag<=lim).length;
     html+=`<div class="hint" style="padding:.25rem 0">★ ${nStars} stars ≤ m${lim.toFixed(1)} up · ${dsoUp.length} deep-sky up</div>`;
+    /* stacking health: which frames were kept, and why the rest were not */
+    if(STACK.on){
+      const sk=STACK.skip;
+      html+='<div class="hint" style="padding:.35rem 0 .1rem">stack · '+STACK.kept+
+        ' frames kept'+(STACK.kept?' · sqrt(n) gain ×'+Math.sqrt(STACK.kept).toFixed(1):'')+
+        (STACK.rms!=null?' · registration '+STACK.rms.toFixed(2)+'px':'')+
+        (STACK.sig!=null?' · noise ±'+STACK.sig.toFixed(1):'')+
+        (STACK.refSrc?' · '+STACK.refSrc.length+' stars locked':' · aligning on compass only')+
+        '</div>';
+      const rows=[['moving too fast',sk.move],['motion blurred',sk.blur],
+                  ['pointed away',sk.drift],['could not register',sk.align]];
+      rows.forEach(r=>{if(r[1])html+='<div class="obj"><span class="nm">dropped: '+r[0]+
+        '</span><span class="v">'+r[1]+' frames</span></div>';});
+    }
+
     /* scan results sit above the routine sky list — they are the reason to look */
     if(SCAN.on){
       const conf=scanConfirmed();
@@ -2398,6 +2645,8 @@ function stats_gen(){
 setSheetOpen(recall('sw.sheet',true));
 setSetupOpen(recall('sw.setup',false));
 setNight(recall('sw.night',false));
+applyGain();
+setView(recallStr('sw.view','live'));
 renderBar();
 setInterval(renderBar,1000);
 
