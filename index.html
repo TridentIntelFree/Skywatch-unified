@@ -32,10 +32,9 @@
   #proc{display:none}
   #stack{position:absolute;inset:0;width:100%;height:100%;display:none}
   #stack.on{display:block}
-  /* Real-time intensification: gain and contrast on the GPU, costing no pixel readback,
-     over a motion-adaptive rolling average. This is about as close to a night-vision
-     tube as a phone camera gets. */
-  #stack.boost{filter:brightness(var(--boost,2.2)) contrast(1.35) saturate(.55)}
+  /* Boost does its lifting as a real levels stretch in paintBoost; all that is left
+     here is to take the edge off chroma noise. */
+  #stack.boost{filter:saturate(.7)}
 
   header{position:absolute;top:0;left:0;right:0;z-index:5;pointer-events:none;
     display:flex;align-items:baseline;gap:.5rem;padding:.5rem .7rem;
@@ -182,7 +181,7 @@
     <div class="slide"><label>Sensitivity</label><input type="range" id="sens" min="6" max="60" value="26"><output id="oSens">26</output></div>
     <div class="slide"><label>Camera FOV</label><input type="range" id="fov" min="25" max="120" value="68"><output id="oFov">68°</output></div>
     <div class="slide"><label>Heading trim</label><input type="range" id="trim" min="-180" max="180" value="0"><output id="oTrim">0°</output></div>
-    <div class="slide"><label>Enhance</label><input type="range" id="gain" min="2" max="30" step="1" value="12"><output id="oGain">12</output></div>
+    <div class="slide"><label>Enhance</label><input type="range" id="gain" min="2" max="30" step="1" value="8"><output id="oGain">8</output></div>
     <div class="slide"><label>Star mag ≤</label><input type="range" id="smag" min="1.5" max="6.5" step="0.5" value="4.0"><output id="oSmag">4.0</output></div>
     <div class="slide"><label>Sat TLE URL</label><input type="text" id="tleUrl" value="https://celestrak.org/NORAD/elements/gp.php?GROUP=visual&FORMAT=tle"></div>
     <div class="slide"><label>Star DB URL</label><input type="text" id="starUrl" placeholder="optional: hosted catalog JSON [[name,ra°,dec°,mag],…] or CSV"></div>
@@ -208,6 +207,7 @@
   <div class="group">
     <div class="lbl">2 · observe</div>
     <div class="btnrow">
+      <button class="tog" id="viewBtn" data-on="0">View · Live</button>
       <button class="tog" id="stackBtn" data-on="0" disabled>Stack</button>
       <button id="solve" disabled>Solve</button>
       <button class="tog" id="scanBtn" data-on="0" disabled>Scan</button>
@@ -217,7 +217,6 @@
   </div>
 
   <div class="btnrow modes">
-    <button class="tog" id="viewBtn" data-on="0">View · Live</button>
     <button class="tog" id="nightBtn" data-on="0">Red UI</button>
     <button class="tog" id="setupToggle" data-on="0">Setup</button>
   </div>
@@ -686,7 +685,9 @@ let me=null, heading=null, elevation=null, running=false;
 let basis=null,rawBasis=null; // {f,r,u}: camera forward, screen right, screen up — earth [E,N,U]
 let FOV={tx:0.67,ty:1.45},RAWFOV={tx:0.67,ty:1.45};  // tan(half-FOV) per screen axis
 let prev=null, hitCount=0, cooldown=0;
-/* EVERY module's state object lives here, not beside its module. fit(), renderDiag()
+/* EVERY module's state object lives here, not beside its module, and anything the
+   readiness chips or the guide line call must be a `function` declaration rather than
+   a `const` arrow — arrows are not hoisted either. fit(), renderDiag()
    and renderBar() all run while the script is still evaluating, and a `const` declared
    further down is in the temporal dead zone at that moment — one read throws and kills
    every remaining line of the script. Add new module state to this block. */
@@ -696,13 +697,16 @@ const solveAgeS=()=>SOLVE.R?(Date.now()-SOLVE.t)/1000:null;
 const solveLive=()=>!!SOLVE.R&&(Date.now()-SOLVE.t)<SOLVE_TTL*1000;
 const STACK={on:false,n:0,kept:0,ref:null,fov:null,ctx:null,warp:null,wctx:null,
              mean:null,mctx:null,sum:null,cov:null,w:0,h:0,refSrc:null,rms:null,
-             drift:6,maxRate:8,lastPaint:0,lastRef:0,rate:0,
+             drift:6,maxRate:8,lastPaint:0,lastRef:0,rate:0,rateNet:0,
              sharpBest:null,hist:[],skip:{move:0,blur:0,drift:0,align:0}};
 const LOCK={on:false,samples:[],rad:14,started:0,verdict:null,lastCalc:0,
             lastSeen:0,seed:{x:0,y:0},pol:1,starPsf:null};
 const SCAN={on:false,events:[],occ:[],last:0,dcur:null,dctx:null,dref:null,rctx:null,
             base:new Map(),globalDim:false,noise:0,nStars:0};
 const VIEWS=['live','boost','stack'];
+const NV={c:null,ctx:null,last:0,period:55,sig:null,bg:null,
+          buf:null,sm:null,w:0,h:0,init:false};
+const CAMSET={applied:false,fps:null,exposure:null,iso:null,note:''};
 let aircraft=[], satrecs=[], knowns=[];   // knowns: {name,az,el,color,kind}
 let starsUp=[], dsoUp=[], radUp=[];       // fixed-sky layers, refreshed with knowns
 let lastCapture=null;
@@ -797,6 +801,8 @@ function renderChips(){
                   /rx/.test(diag.air)?'ok':'warn'));
   c.push(chipHtml(engineReady?'SAT '+Math.round(SATENGINE.stats().visible/100)/10+'k':'SAT …',
                   engineReady?'ok':'warn'));
+  const cl=camLabel();
+  if(cl)c.push(chipHtml('EXP '+cl,'ok'));
   if(STACK.on){
     const sk=STACK.skip,drop=sk.move+sk.blur+sk.drift+sk.align;
     c.push(chipHtml('STACK '+STACK.kept,'ok'));
@@ -1315,6 +1321,67 @@ function drawOverlay(){
 
 
 
+
+/* ============================ asking the sensor for more light ============================
+ Stacking and stretching only redistribute the photons that were captured. The one way
+ to actually collect more is to make each frame longer, so when a deep mode is on we ask
+ the camera to slow down: at 30 fps an exposure can be at most 33 ms, at 8 fps it can be
+ four times that. Where the browser exposes manual exposure and gain (Chrome on Android
+ does, Safari generally does not) we ask for the longest exposure and highest ISO the
+ device admits to, and pin focus at infinity so it stops hunting on a starfield.
+
+ Every part of this is best-effort. The browser decides what it will grant, so whatever
+ comes back from getSettings is reported rather than assumed.
+========================================================================================= */
+async function tuneCamera(deep){
+  const st=video.srcObject;
+  if(!st)return;
+  const track=st.getVideoTracks()[0];
+  if(!track)return;
+  const caps=track.getCapabilities?(track.getCapabilities()||{}):{};
+  const adv=[];
+  try{
+    if(deep){
+      if(caps.exposureMode&&caps.exposureMode.indexOf('manual')>=0){
+        adv.push({exposureMode:'manual'});
+        if(caps.exposureTime&&caps.exposureTime.max)adv.push({exposureTime:caps.exposureTime.max});
+      }
+      if(caps.iso&&caps.iso.max)adv.push({iso:caps.iso.max});
+      if(caps.focusMode&&caps.focusMode.indexOf('manual')>=0){
+        adv.push({focusMode:'manual'});
+        if(caps.focusDistance)adv.push({focusDistance:caps.focusDistance.min});
+      }
+    }else{
+      if(caps.exposureMode&&caps.exposureMode.indexOf('continuous')>=0)
+        adv.push({exposureMode:'continuous'});
+      if(caps.focusMode&&caps.focusMode.indexOf('continuous')>=0)
+        adv.push({focusMode:'continuous'});
+    }
+    const con={frameRate:deep?{ideal:8,max:12}:{ideal:30}};
+    if(adv.length)con.advanced=adv;
+    await track.applyConstraints(con);
+    CAMSET.note='';
+  }catch(e){CAMSET.note=e.name||'refused';}
+  try{
+    const g=track.getSettings?(track.getSettings()||{}):{};
+    CAMSET.fps=g.frameRate!=null?Math.round(g.frameRate*10)/10:null;
+    CAMSET.exposure=g.exposureTime!=null?g.exposureTime:null;
+    CAMSET.iso=g.iso!=null?g.iso:null;
+    CAMSET.applied=deep;
+  }catch(e){}
+  renderBar();
+}
+/* deep modes are Stack or Boost; Live goes back to a normal responsive stream */
+function syncCamera(){tuneCamera(!!(STACK.on||VIEW==='boost'));}
+function camLabel(){
+  if(!CAMSET.applied)return null;
+  const bits=[];
+  if(CAMSET.fps)bits.push(CAMSET.fps+'fps');
+  if(CAMSET.exposure)bits.push(CAMSET.exposure+'µs');
+  if(CAMSET.iso)bits.push('ISO'+CAMSET.iso);
+  return bits.length?bits.join(' '):null;
+}
+
 /* ============================ display modes ============================
  Three ways to look at the same camera:
    Live  — the raw sensor, warts and all.
@@ -1326,7 +1393,6 @@ function drawOverlay(){
            and asinh-stretched. Slow to build, far and away the cleanest.
 ====================================================================== */
 let VIEW='live';
-const NV={c:null,ctx:null};
 function applyGain(){
   const g=+$('gain').value;
   document.documentElement.style.setProperty('--boost',(1+g/9).toFixed(2));
@@ -1336,7 +1402,8 @@ function sizeView(){
   if($('stack').width!==W||$('stack').height!==H){$('stack').width=W;$('stack').height=H;}
   if(!NV.c){NV.c=document.createElement('canvas');NV.ctx=NV.c.getContext('2d');}
   if(NV.c.width!==W||NV.c.height!==H){
-    NV.c.width=W;NV.c.height=H;NV.ctx.fillStyle='#000';NV.ctx.fillRect(0,0,W,H);}
+    NV.c.width=W;NV.c.height=H;NV.ctx.fillStyle='#000';NV.ctx.fillRect(0,0,W,H);
+    NV.init=false;}
 }
 function setView(v){
   VIEW=v;
@@ -1347,9 +1414,10 @@ function setView(v){
   $('viewBtn').dataset.on=shown?'1':'0';
   $('viewBtn').textContent='View · '+(v==='live'?'Live':v==='boost'?'Boost':'Stack');
   if(v==='stack'&&!STACK.on)setStack(true);
-  if(v==='boost')setStatus('Boost: frames averaged just long enough to kill the noise, and '+
-    'the window shortens by itself when you move so it will not smear. Use the Enhance '+
-    'slider under Setup for gain.','ok');
+  syncCamera();
+  if(v==='boost')setStatus('Boost: about 25 frames averaged when you hold still, black point '+
+    'subtracted and the remainder stretched — the part a brightness filter cannot do. The '+
+    'window shortens by itself when you move. Enhance slider under Setup sets the gain.','ok');
   else if(v==='stack')setStatus('Showing the deep stack. Hold steady — every well-registered '+
     'frame goes in, and dropped ones are listed under Sky now.','ok');
   else if(shown===false)setStatus('Live camera.','');
@@ -1358,17 +1426,67 @@ function setView(v){
 }
 function cycleView(){setView(VIEWS[(VIEWS.indexOf(VIEW)+1)%VIEWS.length]);}
 /* rolling average whose time constant follows how fast the phone is actually moving */
+/* vertical pass of the separable blur, in place */
+function buf2set(a,i,u,d){
+  a[i]  =(a[u]  +a[i]  +a[d]  )/3;
+  a[i+1]=(a[u+1]+a[i+1]+a[d+1])/3;
+  a[i+2]=(a[u+2]+a[i+2]+a[d+2])/3;
+}
 function paintBoost(){
   if(!running)return;
+  const now=performance.now();
+  if(now-NV.last<NV.period)return;
+  NV.last=now;
   sizeView();
-  const W=overlay.width,H=overlay.height;
-  /* long window when still (about 3x cleaner), collapsing to none when you pan so it
-     never smears — the same trade a night-vision tube makes */
-  const a=Math.min(1,Math.max(0.18,0.18+STACK.rate*0.09));
-  NV.ctx.globalAlpha=a;
-  if(!drawCameraFrame(NV.ctx,W,H)){NV.ctx.globalAlpha=1;return;}
-  NV.ctx.globalAlpha=1;
-  STACK.ctx.drawImage(NV.c,0,0);
+  const W=overlay.width,H=overlay.height,NP=W*H;
+  if(!NV.buf||NV.w!==W||NV.h!==H){NV.buf=new Float32Array(NP*3);NV.w=W;NV.h=H;NV.init=false;}
+  NV.ctx.setTransform(1,0,0,1,0,0);
+  if(!drawCameraFrame(NV.ctx,W,H))return;
+  const img=NV.ctx.getImageData(0,0,W,H),d=img.data,buf=NV.buf;
+  /* Exponential average in float, not on an 8-bit canvas. A night sky can sit inside
+     ten counts, so rounding each blend to whole counts costs most of what averaging
+     buys — this is the same ceiling the deep stack hit. Window is about a second when
+     you hold still and collapses to a single frame as you pan, so it never smears. */
+  const a=Math.min(1,Math.max(0.06,0.06+STACK.rateNet*0.16));
+  if(!NV.init){
+    for(let i=0,p=0,q=0;i<NP;i++,p+=4,q+=3){buf[q]=d[p];buf[q+1]=d[p+1];buf[q+2]=d[p+2];}
+    NV.init=true;
+  }else{
+    for(let i=0,p=0,q=0;i<NP;i++,p+=4,q+=3){
+      buf[q]+=(d[p]-buf[q])*a;buf[q+1]+=(d[p+1]-buf[q+1])*a;buf[q+2]+=(d[p+2]-buf[q+2])*a;}
+  }
+  /* Light spatial smoothing before display. This is matched filtering, not cosmetic
+     softening: convolving with a kernel about the size of the point-spread maximises
+     signal-to-noise for point sources, so faint stars come up while the grain between
+     them goes down. Stars here run a couple of pixels across, so 3x3 is close to
+     matched — and it is done on a copy, leaving the accumulator untouched. */
+  if(!NV.sm||NV.sm.length!==NP*3)NV.sm=new Float32Array(NP*3);
+  const sm=NV.sm;
+  for(let y=0;y<H;y++){
+    const row=y*W;
+    for(let x=0;x<W;x++){
+      const i=(row+x)*3, l=x>0?i-3:i, r=x<W-1?i+3:i;
+      sm[i]  =(buf[l]  +buf[i]  +buf[r]  )/3;
+      sm[i+1]=(buf[l+1]+buf[i+1]+buf[r+1])/3;
+      sm[i+2]=(buf[l+2]+buf[i+2]+buf[r+2])/3;
+    }
+  }
+  for(let y=0;y<H;y++){
+    const row=y*W;
+    for(let x=0;x<W;x++){
+      const i=(row+x)*3, u=y>0?i-W*3:i, dn=y<H-1?i+W*3:i;
+      buf2set(sm,i,u,dn);
+    }
+  }
+  const st=stretchLutF(sm,NP,+$('gain').value);
+  NV.sig=st.sig;NV.bg=st.med;
+  const lut=st.lut;
+  for(let i=0,p=0,q=0;i<NP;i++,p+=4,q+=3){
+    d[p]  =lut[Math.max(0,Math.min(1023,Math.round(sm[q]*4)))];
+    d[p+1]=lut[Math.max(0,Math.min(1023,Math.round(sm[q+1]*4)))];
+    d[p+2]=lut[Math.max(0,Math.min(1023,Math.round(sm[q+2]*4)))];
+  }
+  STACK.ctx.putImageData(img,0,0);
 }
 
 /* ============================ frame stacking for low light ============================
@@ -1503,6 +1621,12 @@ function updateRate(){
     found=true;
   }
   if(found)STACK.rate=best;
+  /* Net displacement as well as worst excursion. The max is the right conservative
+     signal for rejecting smeared frames, but it is also the most sensitive to sensor
+     noise, and using it to size Boost's averaging window needlessly shortened it. */
+  let ref=null;
+  for(const h of H){if(t-h.t>=250)ref=h;else break;}
+  if(ref){const dt=(t-ref.t)/1000;if(dt>0)STACK.rateNet=angBetween(basis.f,ref.f)/dt;}
 }
 function stackFrame(){
   if(!STACK.on||!running||!basis)return;
@@ -1563,8 +1687,62 @@ function refreshRefSrc(){
   const g=stackGray(true);
   if(g)STACK.refSrc=extractSources(g,14);
 }
-/* asinh stretch off an auto black point: lifts the faint end hard while leaving
-   bright stars unclipped, which a linear contrast boost cannot do */
+/* The stretch that actually pulls signal out of darkness, shared by Boost and Stack.
+   A multiplicative gain cannot do this: brightness(2.3) on a night-sky pixel value of
+   8 gives 18, which is still black. What matters is subtracting the black point first
+   and then stretching what remains, which is why this is a levels operation on pixels
+   rather than a CSS filter. Anchored to the measured noise so the background stays
+   down instead of being amplified into confetti. */
+function stretchLut(d,gain){
+  const hist=new Uint32Array(256);let n=0;
+  for(let i=0;i<d.length;i+=44){hist[(d[i]*77+d[i+1]*150+d[i+2]*29)>>8]++;n++;}
+  let c=0,med=0;
+  for(let i=0;i<256;i++){c+=hist[i];if(c>=n*0.5){med=i;break;}}
+  const dev=new Uint32Array(256);
+  for(let i=0;i<256;i++)if(hist[i])dev[Math.abs(i-med)]+=hist[i];
+  c=0;let mad=1;
+  for(let i=0;i<256;i++){c+=dev[i];if(c>=n*0.5){mad=Math.max(1,i);break;}}
+  const sig=mad*1.4826;
+  let p998=255;c=0;
+  for(let i=255;i>=0;i--){c+=hist[i];if(c>=n*0.002){p998=i;break;}}
+  const black=Math.max(0,med-sig);
+  const white=Math.min(255,Math.max(p998,med+10*sig,black+8));
+  const A=Math.max(2,gain),den=Math.asinh(A),lut=new Uint8Array(256);
+  for(let i=0;i<256;i++){
+    const x=Math.min(1,Math.max(0,(i-black)/(white-black)));
+    lut[i]=Math.round(255*Math.asinh(A*x)/den);
+  }
+  return{lut,med,sig};
+}
+function applyLut(d,lut){
+  for(let i=0;i<d.length;i+=4){d[i]=lut[d[i]];d[i+1]=lut[d[i+1]];d[i+2]=lut[d[i+2]];}
+}
+/* Same stretch, but reading a float buffer at quarter-count resolution. On a real night
+   sky the whole signal can live in the bottom ten counts, where rounding to 8 bits
+   before stretching throws away most of what the averaging just recovered. */
+function stretchLutF(buf,NP,gain){
+  const B=1024,hist=new Uint32Array(B);let n=0;
+  for(let i=0,q=0;i<NP;i+=7,q=i*3){
+    const L=(buf[q]*77+buf[q+1]*150+buf[q+2]*29)/256;
+    hist[Math.max(0,Math.min(B-1,Math.round(L*4)))]++;n++;}
+  let c=0,med=0;
+  for(let i=0;i<B;i++){c+=hist[i];if(c>=n*0.5){med=i;break;}}
+  const dev=new Uint32Array(B);
+  for(let i=0;i<B;i++)if(hist[i])dev[Math.abs(i-med)]+=hist[i];
+  c=0;let mad=1;
+  for(let i=0;i<B;i++){c+=dev[i];if(c>=n*0.5){mad=Math.max(1,i);break;}}
+  const sig=mad*1.4826;
+  let p998=B-1;c=0;
+  for(let i=B-1;i>=0;i--){c+=hist[i];if(c>=n*0.002){p998=i;break;}}
+  const black=Math.max(0,med-sig);
+  const white=Math.min(B-1,Math.max(p998,med+10*sig,black+8));
+  const A=Math.max(2,gain),den=Math.asinh(A),lut=new Uint8Array(B);
+  for(let i=0;i<B;i++){
+    const x=Math.min(1,Math.max(0,(i-black)/(white-black)));
+    lut[i]=Math.round(255*Math.asinh(A*x)/den);
+  }
+  return{lut,med:med/4,sig:sig/4};
+}
 function paintStack(){
   const W=STACK.w,H=STACK.h;
   if(!W||!H||!STACK.sum)return;
@@ -1578,31 +1756,9 @@ function paintStack(){
     d[p+3]=255;
   }
   STACK.mctx.putImageData(img,0,0);            // true mean: what scan and solve read
-  const hist=new Uint32Array(256);let n=0;
-  for(let i=0;i<d.length;i+=44){hist[(d[i]*77+d[i+1]*150+d[i+2]*29)>>8]++;n++;}
-  /* Anchor the stretch to the measured noise, not to percentiles. On an almost
-     featureless field the 99.8th percentile sits only about three sigma above the
-     median, so a percentile stretch maps pure noise to full white and hands you a
-     screen of confetti. Pinning white at least ten sigma up keeps the background in
-     the bottom of the range and lets only real signal climb out of it. */
-  let c2=0,med=0;
-  for(let i=0;i<256;i++){c2+=hist[i];if(c2>=n*0.5){med=i;break;}}
-  const dev=new Uint32Array(256);
-  for(let i=0;i<256;i++)if(hist[i])dev[Math.abs(i-med)]+=hist[i];
-  c2=0;let mad=1;
-  for(let i=0;i<256;i++){c2+=dev[i];if(c2>=n*0.5){mad=Math.max(1,i);break;}}
-  const sig=mad*1.4826;
-  let p998=255;c2=0;
-  for(let i=255;i>=0;i--){c2+=hist[i];if(c2>=n*0.002){p998=i;break;}}
-  const black=Math.max(0,med-sig);
-  const white=Math.min(255,Math.max(p998,med+10*sig,black+8));
-  STACK.bg=med;STACK.sig=sig;
-  const A=Math.max(2,+$('gain').value),den=Math.asinh(A),lut=new Uint8Array(256);
-  for(let i=0;i<256;i++){
-    const x=Math.min(1,Math.max(0,(i-black)/(white-black)));
-    lut[i]=Math.round(255*Math.asinh(A*x)/den);
-  }
-  for(let i=0;i<d.length;i+=4){d[i]=lut[d[i]];d[i+1]=lut[d[i+1]];d[i+2]=lut[d[i+2]];}
+  const st=stretchLut(d,+$('gain').value);
+  STACK.bg=st.med;STACK.sig=st.sig;
+  applyLut(d,st.lut);
   STACK.ctx.putImageData(img,0,0);
 }
 /* the stacked mean, at detector resolution, for the solver and the difference imager */
@@ -1622,6 +1778,7 @@ function setStack(on){
     'on the compass, and any frame taken mid-movement is thrown away rather than smeared in — '+
     'so hold steady and it keeps building. Drifting off just pauses it.','ok');}
   else setStatus('Stacking off — back to the live frame.','');
+  syncCamera();
 }
 
 /* ============================ astrometric pointing solve ============================
@@ -2267,7 +2424,7 @@ function mergeEvents(blobs){
   });
   SCAN.events=SCAN.events.filter(e=>now-e.last<3000);
 }
-const scanConfirmed=()=>SCAN.events.filter(e=>e.n>=3);
+function scanConfirmed(){return SCAN.events.filter(e=>e.n>=3);}
 function scanOccult(gray){
   if(!basis||!starsUp.length)return;
   const now=Date.now(),seen=[];
