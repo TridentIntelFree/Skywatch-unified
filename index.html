@@ -863,7 +863,7 @@ let geoWatch=null, geoNudge=null, skyTimer=null, airTimer=null;
    often than the sky — the public ADS-B endpoints ask for a light touch. */
 function startTimers(){
   if(!skyTimer)skyTimer=setInterval(refreshSky,4000);
-  if(!airTimer)airTimer=setInterval(loadAircraft,15000);
+  if(!airTimer)airTimer=setInterval(loadAircraft,5000);   // shorter dead-reckoning arc
 }
 function setLocation(lat,lon,alt,how){
   me={lat,lon,alt};
@@ -1022,9 +1022,31 @@ async function loadAircraft(){
     `https://opendata.adsb.fi/api/v2/lat/${me.lat.toFixed(4)}/lon/${me.lon.toFixed(4)}/dist/100`];
   for(const u of urls){try{const r=await fetch(u,{headers:{Accept:'application/json'}});
     if(!r.ok)continue;const j=await r.json();const list=j.ac||j.aircraft;
-    if(list){aircraft=list.filter(a=>typeof a.lat==='number'&&typeof a.lon==='number');
+    if(list){
+      const now=Date.now();
+      aircraft=list.filter(a=>typeof a.lat==='number'&&typeof a.lon==='number');
+      aircraft.forEach(a=>{a._t=now;});      // when this snapshot was taken
       diag.air=aircraft.length+' rx';renderDiag();return;}}catch(e){}}
   aircraft=[];diag.air='blocked';renderDiag(); // CORS/network — overlay still runs on sky bodies
+}
+/* Carry an aircraft forward from the position it reported.
+   ADS-B gives a snapshot, and an airliner overhead sweeps better than a degree a
+   second: between polls it moves tens of degrees, so matching a live sighting against
+   the raw snapshot could never work once the pointing gate tightened. Ground speed,
+   track and climb rate are in the message, so fly it forward to now. */
+function reckonAircraft(a,tMs){
+  const age=Math.max(0,(tMs-(a._t||tMs))/1000+(a.seen_pos||0));
+  const altFt=(a.alt_baro==='ground'||a.alt_baro==null)?0:a.alt_baro;
+  let alt=altFt*0.3048;
+  if(isFinite(a.baro_rate))alt+=a.baro_rate*0.00508*age;   // ft/min -> m/s
+  if(!(age>0)||!isFinite(a.gs)||!isFinite(a.track))
+    return{lat:a.lat,lon:a.lon,alt:Math.max(0,alt),age};
+  const R=6371000,d=(a.gs*0.514444*age)/R,brg=a.track*D2R;
+  const la1=a.lat*D2R,lo1=a.lon*D2R;
+  const la2=Math.asin(Math.sin(la1)*Math.cos(d)+Math.cos(la1)*Math.sin(d)*Math.cos(brg));
+  const lo2=lo1+Math.atan2(Math.sin(brg)*Math.sin(d)*Math.cos(la1),
+                           Math.cos(d)-Math.sin(la1)*Math.sin(la2));
+  return{lat:la2*R2D,lon:rev((lo2*R2D)+180)-180,alt:Math.max(0,alt),age};
 }
 $('loadSat').addEventListener('click',async()=>{
   const url=$('tleUrl').value.trim();
@@ -1067,6 +1089,40 @@ $('starUrl').addEventListener('change',async e=>{
   }
 });
 
+/* Aircraft, flown forward to this instant.
+   Kept separate from the four-second sky refresh because they will not hold still for
+   it: at better than half a degree a second, a position that is even one refresh old
+   is already outside the matching gate. This runs from the render loop instead. */
+function airNow(){
+  if(!me||!aircraft.length)return[];
+  const t=Date.now(),obs=geoToEcef(me.lat,me.lon,me.alt),out=[];
+  aircraft.forEach(a=>{
+    const p=reckonAircraft(a,t);
+    const la=lookAngles(me.lat,me.lon,obs,geoToEcef(p.lat,p.lon,p.alt));
+    if(la.el<=0)return;
+    /* its own sky-track rate, taken analytically a second ahead rather than from the
+       previous refresh — exact, and available on the very first sighting */
+    const q=reckonAircraft(a,t+1000);
+    const lb=lookAngles(me.lat,me.lon,obs,geoToEcef(q.lat,q.lon,q.alt));
+    /* uncertainty grows with how long we have been flying it forward: a few percent of
+       velocity error, plus the chance it turned while we were not looking */
+    out.push({name:(a.flight||a.hex||'ac').trim(),az:la.az,el:la.el,
+      color:'var(--air)',kind:'air',age:p.age,
+      rate:angSepDeg(la.az,la.el,lb.az,lb.el),
+      slop:Math.min(4,0.25+p.age*0.09),
+      meta:`${Math.round(la.range/1000)}km`+(p.age>1.5?` · ${Math.round(p.age)}s dr`:'')});
+  });
+  return out;
+}
+let lastAirSync=0;
+function syncAircraft(){
+  if(!me||!aircraft.length)return;
+  const t=Date.now();
+  if(t-lastAirSync<200)return;
+  lastAirSync=t;
+  knowns=knowns.filter(o=>o.kind!=='air').concat(airNow());
+}
+
 /* recompute all known object az/el */
 let prevKnowns=new Map();
 function refreshSky(){
@@ -1081,10 +1137,7 @@ function refreshSky(){
     const pos=planetAzAlt(p,now,me.lat,me.lon);
     if(pos.alt>0)k.push({name:p+' ~',az:pos.az,el:pos.alt,color:'var(--planet)',kind:'planet'});}catch(e){}});
   const obs=geoToEcef(me.lat,me.lon,me.alt);
-  aircraft.forEach(a=>{const alt=(a.alt_baro==='ground'||a.alt_baro==null)?0:a.alt_baro*0.3048;
-    const la=lookAngles(me.lat,me.lon,obs,geoToEcef(a.lat,a.lon,alt));
-    if(la.el>0)k.push({name:(a.flight||a.hex||'ac').trim(),az:la.az,el:la.el,color:'var(--air)',kind:'air',
-      meta:`${Math.round(la.range/1000)}km`});});
+  airNow().forEach(o=>k.push(o));
   let satUp=0;
   if(satrecs.length){const gmst=satellite.gstime(now),gd={longitude:me.lon*D2R,latitude:me.lat*D2R,height:me.alt/1000};
     satrecs.forEach(s=>{try{const pv=satellite.propagate(s.sr,now);if(!pv.position)return;
@@ -1097,7 +1150,7 @@ function refreshSky(){
   const tNow=now.getTime(),nextPrev=new Map();
   k.forEach(o=>{
     const p=prevKnowns.get(o.kind+'|'+o.name);
-    if(p){const dt=(tNow-p.t)/1000;
+    if(p&&o.rate==null){const dt=(tNow-p.t)/1000;
       if(dt>0.5&&dt<60)o.rate=angSepDeg(p.az,p.el,o.az,o.el)/dt;}
     nextPrev.set(o.kind+'|'+o.name,{az:o.az,el:o.el,t:tNow});
   });
@@ -2144,7 +2197,7 @@ function photometry(){
 /* everything the app currently believes is up there, with its own sky-track rate */
 function candidates(){
   const out=[];
-  knowns.forEach(o=>out.push({name:o.name,kind:o.kind,az:o.az,el:o.el,meta:o.meta||'',
+  knowns.forEach(o=>out.push({name:o.name,kind:o.kind,az:o.az,el:o.el,meta:o.meta||'',slop:o.slop||0,
     rate:o.rate!=null?o.rate:(o.kind==='star'?SIDEREAL:
       (o.kind==='sun'||o.kind==='moon'||o.kind==='planet')?SIDEREAL:null)}));
   if(engineReady)engineVisible().forEach(o=>{
@@ -2250,7 +2303,7 @@ function assess(){
   const Q=dataQuality();
   const list=candidates()
     .map(c=>({...c,sep:angSepDeg(last.az,last.el,c.az,c.el),
-              gate:Q.gate+(c.kind==='sat'?Q.tleSlop:0)}))
+              gate:Q.gate+(c.kind==='sat'?Q.tleSlop:0)+(c.slop||0)}))
     .filter(c=>c.sep<=Math.max(Q.gate*2,3))
     .sort((a,b)=>a.sep-b.sep).slice(0,6);
   /* A regular 0.5-3 Hz beacon that goes fully dark is aircraft behaviour. Nothing in
@@ -2523,6 +2576,7 @@ function loop(){
   }
   if(gray){trackLock(gray,rgb);runScan(gray);}
   updateRate();
+  syncAircraft();        // they move too fast to wait for the sky refresh
   stackFrame();
   if(VIEW==='boost')paintBoost();
   drawOverlay();
